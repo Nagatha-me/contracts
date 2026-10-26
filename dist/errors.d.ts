@@ -17,6 +17,11 @@ export declare const ErrorCode: {
     readonly ChallengeInvalid: "CHALLENGE_INVALID";
     readonly DocumentInvalid: "DOCUMENT_INVALID";
     readonly AttestationInvalid: "ATTESTATION_INVALID";
+    readonly AssertionInvalid: "ASSERTION_INVALID";
+    readonly KeyUnknown: "KEY_UNKNOWN";
+    readonly KeyExpired: "KEY_EXPIRED";
+    readonly CounterReplay: "COUNTER_REPLAY";
+    readonly KeyQuota: "KEY_QUOTA";
     readonly NotYet: "NOT_YET";
 };
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode];

@@ -14,10 +14,15 @@ export const ErrorCode = {
     RateLimited: "RATE_LIMITED",
     NotImplemented: "NOT_IMPLEMENTED",
     Internal: "INTERNAL",
-    // Signals (pre-auth REST, see `signals.ts`). Each is a 400 except NOT_YET (501).
+    // Signals (pre-auth REST, see `signals.ts` for each code's HTTP status).
     ChallengeInvalid: "CHALLENGE_INVALID",
     DocumentInvalid: "DOCUMENT_INVALID",
     AttestationInvalid: "ATTESTATION_INVALID",
+    AssertionInvalid: "ASSERTION_INVALID",
+    KeyUnknown: "KEY_UNKNOWN",
+    KeyExpired: "KEY_EXPIRED",
+    CounterReplay: "COUNTER_REPLAY",
+    KeyQuota: "KEY_QUOTA",
     NotYet: "NOT_YET",
 };
 //# sourceMappingURL=errors.js.map

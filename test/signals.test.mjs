@@ -4,7 +4,13 @@ import assert from "node:assert/strict";
 import {
   MAX_DOCUMENT_ITEMS,
   MAX_DOCUMENT_ROUTINE_BLOCKS,
+  ErrorCode,
+  PulseDocumentV1,
+  SIGNAL_KEY_DAILY_UPLOADS,
   SignalDocumentV1,
+  SignalErrorCode,
+  SignalKeyRequest,
+  SignalPulseRequest,
   SignalUploadRequest,
   hasNoControlCharacters,
   signalNameRollupId,
@@ -41,6 +47,59 @@ test("name rollup ids put the name last", () => {
   assert.equal(signalNameRollupId("2026-10-26", "timed", "a|b"), "2026-10-26|timed|a|b");
 });
 
+const KEY_ID = Buffer.alloc(32, 7).toString("base64");
+
+const pulse = {
+  version: 1,
+  kind: "run.finished",
+  at: { hour: 7, weekday: 1 },
+  context: doc.context,
+  programToken: "abcdefghijklmnop",
+  count: 1,
+};
+
+test("a pulse parses, and is strict and bounded", () => {
+  assert.equal(PulseDocumentV1.safeParse(pulse).success, true);
+  assert.equal(PulseDocumentV1.safeParse({ ...pulse, installId: "x" }).success, false);
+  assert.equal(PulseDocumentV1.safeParse({ ...pulse, count: 0 }).success, false);
+  assert.equal(PulseDocumentV1.safeParse({ ...pulse, count: 61 }).success, false);
+  assert.equal(PulseDocumentV1.safeParse({ ...pulse, at: { hour: 24, weekday: 1 } }).success, false);
+  assert.equal(PulseDocumentV1.safeParse({ ...pulse, at: { hour: 0, weekday: 7 } }).success, false);
+  assert.equal(PulseDocumentV1.safeParse({ ...pulse, kind: "app.opened" }).success, false);
+  assert.equal(PulseDocumentV1.safeParse({ ...pulse, context: { ...doc.context, region: "A\u0000" } }).success, false);
+});
+
+test("a program token rides only on run kinds", () => {
+  const { programToken, ...bare } = pulse;
+  assert.equal(PulseDocumentV1.safeParse(bare).success, true);
+  assert.equal(PulseDocumentV1.safeParse({ ...bare, kind: "nag.shown" }).success, true);
+  assert.equal(PulseDocumentV1.safeParse({ ...bare, kind: "nag.shown", programToken }).success, false);
+  assert.equal(PulseDocumentV1.safeParse({ ...pulse, programToken: "short" }).success, false);
+});
+
+test("key and pulse requests", () => {
+  const key = { challenge: "A".repeat(43), keyId: KEY_ID, attestation: "AAAA" };
+  assert.equal(SignalKeyRequest.safeParse(key).success, true);
+  assert.equal(SignalKeyRequest.safeParse({ ...key, keyId: "short" }).success, false);
+  assert.equal(SignalKeyRequest.safeParse({ ...key, document: "{}" }).success, false);
+  const p = { challenge: "A".repeat(43), keyId: KEY_ID, assertion: "AAAA", document: JSON.stringify(pulse) };
+  assert.equal(SignalPulseRequest.safeParse(p).success, true);
+  assert.equal(SignalPulseRequest.safeParse({ ...p, document: "x".repeat(4097) }).success, false);
+  // The 0.1 program upload's attestation field is gone.
+  assert.equal(
+    SignalUploadRequest.safeParse({ platform: "ios", challenge: "A".repeat(43), keyId: KEY_ID, attestation: "AAAA", document: "{}" }).success,
+    false,
+  );
+});
+
+test("the new error codes are on both lists", () => {
+  for (const code of ["ASSERTION_INVALID", "KEY_UNKNOWN", "KEY_EXPIRED", "COUNTER_REPLAY", "KEY_QUOTA"]) {
+    assert.ok(Object.values(ErrorCode).includes(code), code);
+    assert.ok(Object.values(SignalErrorCode).includes(code), code);
+  }
+  assert.equal(SIGNAL_KEY_DAILY_UPLOADS, 200);
+});
+
 const routineItem = (n, blocks = 1) => ({
   name: `item ${n}`,
   kind: "timed",
@@ -70,13 +129,13 @@ test("control characters are refused in every string field", () => {
   const upload = {
     platform: "ios",
     challenge: "A".repeat(43),
-    keyId: "key\u0001id",
-    attestation: "AAAA",
+    keyId: KEY_ID,
+    assertion: "AAAA",
     document: "{\n  \"version\": 1\n}",
   };
-  assert.equal(SignalUploadRequest.safeParse(upload).success, false);
+  assert.equal(SignalUploadRequest.safeParse({ ...upload, assertion: "AA\u0001A" }).success, false);
   // The document text may hold JSON whitespace; its parsed strings are checked by the document schema.
-  assert.equal(SignalUploadRequest.safeParse({ ...upload, keyId: "keyid" }).success, true);
+  assert.equal(SignalUploadRequest.safeParse(upload).success, true);
 });
 
 test("the whole document holds at most 400 items", () => {

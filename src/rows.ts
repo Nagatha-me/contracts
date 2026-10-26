@@ -43,6 +43,15 @@ export interface UserRow {
  * not a count of unique programs. Unique programs come later, with the
  * program token dedupe of design section 8; this column keeps its name and
  * its meaning when that lands.
+ *
+ * `uploads` counts program documents (`POST /signals`); `pulses` counts
+ * accepted pulses (`POST /signals/pulse`). The per-kind counters add each
+ * pulse's `count`: run.started to `runsStarted`, run.finished to
+ * `runsFinished`, nag.shown to `nagsShown`, nag.completed to `nagsCompleted`,
+ * nag.snoozed to `snoozes`, nag.skipped to `skips`, line.shared to `shares`,
+ * line.laughed to `laughs`. A program document also adds its week's
+ * `nagsShown`, `nagsCompleted`, `runsStarted` and `runsFinished`, as before
+ * 0.2.0; it does not touch `pulses` or the four counters added in 0.2.0.
  */
 export interface SignalRollupRow {
   id: string;
@@ -50,10 +59,20 @@ export interface SignalRollupRow {
   region: string;
   uploads: number;
   programs: number;
+  /** Accepted pulses (0.2.0). */
+  pulses: number;
   nagsShown: number;
   nagsCompleted: number;
   runsStarted: number;
   runsFinished: number;
+  /** From pulses only (0.2.0). */
+  snoozes: number;
+  /** From pulses only (0.2.0). */
+  skips: number;
+  /** From pulses only (0.2.0). */
+  shares: number;
+  /** From pulses only (0.2.0). */
+  laughs: number;
   updatedAt: string;
 }
 

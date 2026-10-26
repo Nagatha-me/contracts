@@ -10,10 +10,10 @@ ESM, TypeScript, `zod` 4 as the only dependency.
 | File | Contents |
 |---|---|
 | `src/events.ts` | `SocketEventName` (`SYNC_DATA`, `SYNC_COMPLETE`, `DIFF_SYNC`, `SYNC_RESET`, `SOCKET_EVENT`, `RPC`), the handshake `{ token, cursor?, scope? }`, `SyncScope`, every payload, the per-entity cursor rule, `EventType`, `verbOf` |
-| `src/rows.ts` | `SyncType` and the row types `UserRow`, `SignalRollupRow`, `SignalNameRollupRow`, plus the rollup id builders |
+| `src/rows.ts` | `SyncType` and the row types `UserRow`, `SignalRollupRow` (with `pulses` and the per-kind counters), `SignalNameRollupRow`, plus the rollup id builders |
 | `src/rpc.ts` | `RpcRequest`, `RpcResponse`, `RpcMethod` (`ping`, `admin.whoami`) with inputs and outputs |
 | `src/auth.ts` | `GET /auth/socket-token` response, `POST /admin/claim` request and response |
-| `src/signals.ts` | `SignalDocumentV1` (zod; per-array caps, at most 400 items and 2,000 routine blocks per document, no control characters in any string), `GET /signals/challenge` and `POST /signals` shapes, `SignalErrorCode` |
+| `src/signals.ts` | The day key and assertion protocol, documented at the top; `SignalDocumentV1` (zod; per-array caps, at most 400 items and 2,000 routine blocks per document, no control characters in any string); `PulseDocumentV1`; the `GET /signals/challenge`, `POST /signals/key`, `POST /signals/pulse` and `POST /signals` shapes; `SignalErrorCode` with each code's HTTP status |
 | `src/errors.ts` | `ErrorCode`, `WireError`, `RestErrorBody` |
 
 ## Rules a client must follow
@@ -31,6 +31,11 @@ ESM, TypeScript, `zod` 4 as the only dependency.
   each document's program count), not unique programs. Unique programs come
   later, with the program token dedupe of design section 8.
 
+- **Signals 0.2.0.** `POST /signals` is signed with the day key by an App
+  Attest assertion; the per-upload attestation of 0.1 is gone. Attest the
+  day's key with `POST /signals/key` first. The whole protocol is at the top of
+  `src/signals.ts`.
+
 ## Versioning
 
 SemVer, released with `npm run release` (`scripts/release.mjs`, the same tool
@@ -46,8 +51,8 @@ pushes an annotated `vX.Y.Z` tag.
 
 Consumers pin a tag: `"@nagatha/contracts": "github:Nagatha-me/contracts#vX.Y.Z"`,
 installed with scripts off, which is why `dist/` is committed and every tag
-carries the dist built from its own source. The server uses `file:../contracts`
-until its first deploy.
+carries the dist built from its own source. The server and the web portal both
+pin a tag; link `../contracts` only while working on a change, never commit it.
 
 ## Working on it
 

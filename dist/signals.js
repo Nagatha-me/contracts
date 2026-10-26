@@ -1,18 +1,77 @@
 /**
- * Anonymous usage signals (design section 8). Two pre-auth REST routes, no
- * cookie, no bearer:
+ * Anonymous usage signals (design section 8). Four pre-auth REST routes, no
+ * cookie, no bearer, each behind its own one-time challenge:
  *
- *   GET  /signals/challenge -> SignalChallengeResponse
- *   POST /signals           SignalUploadRequest -> SignalUploadResponse
+ *   GET  /signals/challenge                       -> SignalChallengeResponse
+ *   POST /signals/key     SignalKeyRequest        -> SignalKeyResponse
+ *   POST /signals/pulse   SignalPulseRequest      -> SignalPulseResponse
+ *   POST /signals         SignalUploadRequest     -> SignalUploadResponse
  *
- * The phone scrubs the document before it leaves (three layers, on device).
- * This schema is the server's second line: strict keys, bounded arrays, a cap
- * on the whole document's items and routine blocks, every name capped at 60
- * characters, no control characters in any string, every number in a
- * plausible range.
+ * The day key (live pulse model, owner, 26 October 2026)
+ * -------------------------------------------------------
+ * On the first upload of a day the phone generates an App Attest key
+ * (`DCAppAttestService.generateKey`), fetches a challenge and attests the key
+ * with `clientDataHash = sha256(challengeBytes)`, where `challengeBytes` is the
+ * challenge decoded from base64url (32 bytes). `POST /signals/key` verifies the
+ * attestation against Apple's App Attestation root and keeps ONLY the key id,
+ * the public key, the assertion counter and a per-key pulse count, until
+ * `expiresAt` (24 hours after the attestation). A key id is attested once; a
+ * second attestation of the same key id is 409 CONFLICT.
+ *
+ * Every later upload that day, pulse or program document, fetches a fresh
+ * challenge and is signed with that key by an assertion
+ * (`DCAppAttestService.generateAssertion(keyId, clientDataHash)`) over
+ *
+ *   clientDataHash = sha256(challengeBytes || sha256(documentBytes))
+ *
+ * where `documentBytes` are the exact UTF-8 bytes of the `document` string
+ * sent in the body. The server checks, in order: the challenge is live and
+ * consumes it; the document parses and validates; the key is known (404
+ * KEY_UNKNOWN) and unexpired (410 KEY_EXPIRED); the assertion is CBOR
+ * `{ signature, authenticatorData }`, the signature is ECDSA P-256 with
+ * SHA-256 over `nonce = sha256(authenticatorData || clientDataHash)` under the
+ * stored public key, and authenticatorData's rpIdHash is sha256 of the app id
+ * (400 ASSERTION_INVALID otherwise); the sign counter in authenticatorData is
+ * greater than the stored one (409 COUNTER_REPLAY) and the key has signed
+ * fewer than `SIGNAL_KEY_DAILY_UPLOADS` uploads (429 KEY_QUOTA). The new
+ * counter is stored. Nothing about the key is written to any document or
+ * rollup row, and nothing links one key to the next.
+ *
+ * When a key is refused with KEY_UNKNOWN or KEY_EXPIRED the phone mints and
+ * attests a new key and retries. On KEY_QUOTA it holds its pulses until the
+ * next key. On COUNTER_REPLAY it drops that upload. When the endpoint is away,
+ * pulses are queued on the phone and dropped after seven days.
+ *
+ * Pulses
+ * ------
+ * A pulse is a `PulseDocumentV1`: one event kind, the local hour and weekday,
+ * the context, a program token for a run, and `count`, the events of that
+ * kind coalesced over one minute (1 to 60). The server stores no pulse row:
+ * it adds 1 to the day-and-region rollup's `pulses` and `count` to the kind's
+ * counter, then broadcasts the rollup row.
+ *
+ * Program documents
+ * -----------------
+ * `SignalDocumentV1`, once a day or when a program changes, signed with the
+ * day key the same way. The phone scrubs the document before it leaves (three
+ * layers, on device). These schemas are the server's second line: strict keys,
+ * bounded arrays, a cap on the whole document's items and routine blocks,
+ * every name capped at 60 characters, no control characters in any string,
+ * every number in a plausible range.
+ *
+ * Error codes (beside 429 RATE_LIMITED from the per-IP limiter): INVALID,
+ * CHALLENGE_INVALID, DOCUMENT_INVALID, ATTESTATION_INVALID, ASSERTION_INVALID
+ * (each 400), KEY_UNKNOWN (404), KEY_EXPIRED (410), COUNTER_REPLAY (409),
+ * CONFLICT (409, key already attested), KEY_QUOTA (429), NOT_YET (501, Android).
  */
 import { z } from "zod";
 export const SIGNAL_CHALLENGE_TTL_SECONDS = 120;
+/** A day key lives this long after its attestation. */
+export const SIGNAL_KEY_TTL_SECONDS = 24 * 60 * 60;
+/** Uploads (pulses and program documents together) one day key may sign. */
+export const SIGNAL_KEY_DAILY_UPLOADS = 200;
+/** The most events of one kind a pulse may coalesce (one minute's worth). */
+export const PULSE_COUNT_MAX = 60;
 export const SIGNAL_NAME_MAX = 60;
 /** Across the whole document: items in every stage of every program. */
 export const MAX_DOCUMENT_ITEMS = 400;
@@ -171,35 +230,115 @@ export const SignalDocumentV1 = z
         });
     }
 });
+// ------------------------------------------------------------
+// Pulses
+// ------------------------------------------------------------
+/** The event kinds a pulse may carry. `run.*` kinds may carry a program token. */
+export const PulseKind = z.enum([
+    "run.finished",
+    "run.started",
+    "nag.shown",
+    "nag.completed",
+    "nag.snoozed",
+    "nag.skipped",
+    "line.shared",
+    "line.laughed",
+]);
+/** The program token's shape, the same as `SignalProgram.token`. */
+const programToken = text().regex(/^[A-Za-z0-9_-]{16,32}$/);
+export const PulseDocumentV1 = z
+    .strictObject({
+    version: z.literal(1),
+    kind: PulseKind,
+    /**
+     * When the events happened, on the phone's clock in its own time zone:
+     * `hour` 0 to 23, `weekday` 0 Sunday to 6 Saturday (iOS `weekday` minus 1).
+     */
+    at: z.strictObject({
+        hour: z.number().int().min(0).max(23),
+        weekday: z.number().int().min(0).max(6),
+    }),
+    context: SignalContext,
+    /** The program's current random token, for `run.*` kinds only. Never on any other kind. */
+    programToken: programToken.optional(),
+    /** Events of this kind coalesced over one minute. */
+    count: z.number().int().min(1).max(PULSE_COUNT_MAX),
+})
+    .superRefine((doc, ctx) => {
+    if (doc.programToken !== undefined && !doc.kind.startsWith("run.")) {
+        ctx.addIssue({ code: "custom", path: ["programToken"], message: "a program token rides only on run kinds" });
+    }
+});
+const challenge = text().regex(/^[A-Za-z0-9_-]{43}$/);
+/** base64 of sha256 of the attested public key (32 bytes), as DCAppAttestService returns it. */
+const keyId = text().regex(/^[A-Za-z0-9+/]{43}=$/);
 /**
- * `POST /signals` body. `document` is the JSON text of a `SignalDocumentV1`,
- * sent as a string so the server hashes exactly the bytes the phone hashed.
- *
- * The App Attest clientDataHash is `sha256(challengeBytes || sha256(documentBytes))`,
- * where `challengeBytes` is the decoded challenge and `documentBytes` the UTF-8
- * bytes of `document`. That binds the document to the attestation, so no
- * separate assertion is sent.
+ * The JSON text of the signed document, sent as a string so the server
+ * hashes exactly the bytes the phone hashed. The one string exempt from the
+ * control character rule: JSON text may carry tabs and newlines between
+ * tokens. Every string inside it is checked once it is parsed.
+ */
+const documentText = (max) => z.string().min(2).max(max);
+/** base64 of the CBOR assertion object `{ signature, authenticatorData }`. */
+const assertion = text().min(1).max(4_096);
+/**
+ * `POST /signals/key` body: attest today's key. The attestation's
+ * clientDataHash is `sha256(challengeBytes)`; no document is bound.
+ */
+export const SignalKeyRequest = z.strictObject({
+    challenge,
+    keyId,
+    /** base64 of the CBOR attestation object. */
+    attestation: text().min(1).max(20_000),
+});
+/**
+ * `POST /signals/pulse` body. `document` is the JSON text of a
+ * `PulseDocumentV1`; `assertion` signs
+ * `sha256(challengeBytes || sha256(documentBytes))` with the day key.
+ */
+export const SignalPulseRequest = z.strictObject({
+    challenge,
+    keyId,
+    assertion,
+    document: documentText(4 * 1024),
+});
+/**
+ * `POST /signals` body: a program document. `document` is the JSON text of a
+ * `SignalDocumentV1`, signed with the day key by an assertion over
+ * `sha256(challengeBytes || sha256(documentBytes))`. There is no per-upload
+ * attestation (0.2.0).
  */
 export const SignalUploadRequest = z.strictObject({
     platform: z.enum(["ios", "android"]),
-    challenge: text().regex(/^[A-Za-z0-9_-]{43}$/),
-    /** base64 of sha256 of the attested public key, as DCAppAttestService returns it. */
-    keyId: text().min(1).max(100),
-    /** base64 of the CBOR attestation object. */
-    attestation: text().min(1).max(20_000),
-    /**
-     * The one string exempt from the control character rule: JSON text may
-     * carry tabs and newlines between tokens. Every string inside it is checked
-     * once it is parsed as a `SignalDocumentV1`.
-     */
-    document: z.string().min(2).max(512 * 1024),
+    challenge,
+    keyId,
+    assertion,
+    document: documentText(512 * 1024),
 });
-/** The codes `POST /signals` may answer with, beside RATE_LIMITED (429). */
+/**
+ * The codes the signal routes answer with, beside RATE_LIMITED (429) and
+ * CONFLICT (409, a key id attested twice). HTTP status in brackets.
+ */
 export const SignalErrorCode = {
+    /** [400] The body does not match the request schema. */
     Invalid: "INVALID",
+    /** [400] The challenge is unknown, used or expired. Fetch a new one. */
     ChallengeInvalid: "CHALLENGE_INVALID",
+    /** [400] The document is not JSON or fails its schema. */
     DocumentInvalid: "DOCUMENT_INVALID",
+    /** [400] `POST /signals/key`: the attestation failed verification. */
     AttestationInvalid: "ATTESTATION_INVALID",
+    /** [400] The assertion is not CBOR, the signature fails, or the app id differs. */
+    AssertionInvalid: "ASSERTION_INVALID",
+    /** [404] No live key with this id. Attest a new key. */
+    KeyUnknown: "KEY_UNKNOWN",
+    /** [410] The key's 24 hours are over. Attest a new key. */
+    KeyExpired: "KEY_EXPIRED",
+    /** [409] The assertion's counter is not above the last one accepted. Drop the upload. */
+    CounterReplay: "COUNTER_REPLAY",
+    /** [429] The key has signed its `SIGNAL_KEY_DAILY_UPLOADS`. Wait for the next key. */
+    KeyQuota: "KEY_QUOTA",
+    /** [501] Android, until Play Integrity lands. */
     NotYet: "NOT_YET",
 };
 //# sourceMappingURL=signals.js.map
