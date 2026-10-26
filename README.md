@@ -29,7 +29,7 @@ pushes an annotated `vX.Y.Z` tag.
 
 ## Consuming it
 
-Consumers pin a tag: `"@nagatha/contracts": "github:<org>/nagatha-contracts#vX.Y.Z"`,
+Consumers pin a tag: `"@nagatha/contracts": "github:Nagatha-me/contracts#vX.Y.Z"`,
 installed with scripts off, which is why `dist/` is committed and every tag
 carries the dist built from its own source. The server uses `file:../contracts`
 until its first deploy.

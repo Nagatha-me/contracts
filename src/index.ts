@@ -10,7 +10,7 @@
  *    then the old shape goes), so no deploy order can break a live client;
  *  - comment and documentation fixes: PATCH.
  *
- * Consumers pin a git tag (`github:<org>/nagatha-contracts#vX.Y.Z`) and install
+ * Consumers pin a git tag (`github:Nagatha-me/contracts#vX.Y.Z`) and install
  * with scripts off, so `dist/` is committed and a tag always carries the dist
  * built from its own source.
  */
