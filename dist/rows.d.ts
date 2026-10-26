@@ -11,6 +11,10 @@ export declare const SyncType: {
     readonly User: "user";
     readonly SignalRollup: "signal_rollup";
     readonly SignalNameRollup: "signal_name_rollup";
+    /** 0.4.0: devices and pulses per UTC hour and time zone, the last 48 hours. */
+    readonly SignalHourRollup: "signal_hour_rollup";
+    /** 0.4.0: rolling 7 and 30 day active phones per region and per time zone. */
+    readonly SignalActives: "signal_actives";
 };
 export type SyncType = (typeof SyncType)[keyof typeof SyncType];
 export declare const SYNC_TYPES: readonly SyncType[];
@@ -96,13 +100,92 @@ export interface SignalNameRollupRow {
     count: number;
     updatedAt: string;
 }
+/** Hours of `signal_hour_rollup` a full sync sends: the current hour and the 47 before it. */
+export declare const SIGNAL_HOUR_ROLLUP_SYNC_HOURS = 48;
+/**
+ * Day keys and pulses for one UTC hour and one IANA time zone (0.4.0). Super
+ * admins only. `id` is `${hour}|${timeZone}` (`signalHourRollupId`).
+ *
+ * `hour` is the start of the UTC hour exactly as `Date.prototype.toISOString`
+ * writes it, for example `2026-10-26T10:00:00.000Z`. `devices` counts day keys
+ * attested in that hour from that zone: a phone is counted in the hour of its
+ * first foreground of the UTC day, once a day. `pulses` counts accepted
+ * pulses. `region` is the zone's region: the region of the first phone the
+ * server counted in that zone, fixed from then on (a pulse in a zone no key
+ * has counted yet uses its own).
+ *
+ * The rolling "active now" figure is the client's: the sum of `devices` over
+ * the rows whose `hour` is within the last 24 hours of the client's clock,
+ * re-summed as the clock moves, so it decays with no traffic. Over 24 hours a
+ * phone is counted at most twice (once per UTC day it attested in), so the
+ * figure is distinct phones in the window to within that overlap.
+ */
+export interface SignalHourRollupRow {
+    id: string;
+    hour: string;
+    region: string;
+    timeZone: string;
+    devices: number;
+    pulses: number;
+    updatedAt: string;
+}
+export type SignalActivesScope = "region" | "zone";
+/**
+ * Rolling active phones for one region or one time zone (0.4.0). Super
+ * admins only. `id` is `${scope}|${key}` (`signalActivesId`); `key` is the
+ * ISO region code for scope `region`, the IANA zone for scope `zone`.
+ * `region` is the key itself for scope `region`, and the zone's region for
+ * scope `zone`. A zone belongs to one region, the region of the first phone
+ * counted in it, and a region's rows count the phones of its zones: a phone
+ * whose locale names another country counts under its zone's region.
+ *
+ * The arithmetic. Each day key carries `gapDays` (signals.ts): the UTC days
+ * since that phone's previous active day, or null for never. So a phone
+ * active on day d with gap g was previously active on d minus g, and on no
+ * day in between. For a window of W UTC days ending today T, starting
+ * S = T - (W - 1), the phone is NEW to the window on day d (in the window)
+ * iff g is null or d - g < S: its previous active day is outside the window,
+ * so d is its first active day inside it. Every phone active in the window
+ * has exactly one such first day, so summing, over the days d from S to T,
+ * the attestations on d whose gap makes them new to the window, counts each
+ * phone active in the window exactly once, however many days it was active.
+ *
+ *  - `active7d`: distinct phones active in the last 7 UTC days, today
+ *    included (S = T - 6).
+ *  - `active30d`: the same over the last 30 UTC days (S = T - 29). A gap of
+ *    30 (30 or more) is new to both windows on any day in them.
+ *  - `newToday`: attestations today with gap null: phones counted for the
+ *    first time ever (or after a reset on the phone).
+ *
+ * The server keeps per (UTC day, time zone, gap) attestation counts and
+ * recomputes a row on every day key in its zone or region, and every row once
+ * at the UTC day change, when the windows roll and `newToday` starts again
+ * from zero. A phone attesting twice in one day (rare, a refused key) counts
+ * twice. Region totals are the sum of the region-scope rows; zone rows sum to
+ * the same total.
+ */
+export interface SignalActivesRow {
+    id: string;
+    scope: SignalActivesScope;
+    key: string;
+    region: string;
+    active7d: number;
+    active30d: number;
+    newToday: number;
+    updatedAt: string;
+}
 /** Row type per sync type, for typed routing on the client. */
 export interface SyncRowByType {
     user: UserRow;
     signal_rollup: SignalRollupRow;
     signal_name_rollup: SignalNameRollupRow;
+    signal_hour_rollup: SignalHourRollupRow;
+    signal_actives: SignalActivesRow;
 }
 /** Build the rollup ids, so server and client never disagree on them. */
 export declare function signalRollupId(day: string, region: string): string;
 export declare function signalNameRollupId(day: string, itemKind: string, name: string): string;
+/** `hour` is the ISO start of the UTC hour (`2026-10-26T10:00:00.000Z`). */
+export declare function signalHourRollupId(hour: string, timeZone: string): string;
+export declare function signalActivesId(scope: SignalActivesScope, key: string): string;
 //# sourceMappingURL=rows.d.ts.map

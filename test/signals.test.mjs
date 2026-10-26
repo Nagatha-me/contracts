@@ -15,7 +15,12 @@ import {
   SignalUploadRequest,
   hasNoControlCharacters,
   programPeriods,
+  signalActivesId,
+  signalGapDays,
+  signalHourRollupId,
   signalNameRollupId,
+  SYNC_TYPES,
+  EventType,
   verbOf,
 } from "../dist/index.js";
 
@@ -111,14 +116,19 @@ test("the token rule's periods are the UTC ISO week and UTC month", () => {
 });
 
 test("key and pulse requests", () => {
-  const key = { challenge: "A".repeat(43), keyId: KEY_ID, attestation: "AAAA", context: { region: "AU", timeZone: "Australia/Sydney" } };
+  const keyContext = { ...doc.context, gapDays: 3 };
+  const key = { challenge: "A".repeat(43), keyId: KEY_ID, attestation: "AAAA", context: keyContext };
   assert.equal(SignalKeyRequest.safeParse(key).success, true);
-  // 0.3.0: the context is required, both fields, strict, with the document context's shapes.
+  // 0.4.0: the context is the full document context plus gapDays, required, strict.
   const { context, ...noContext } = key;
   assert.equal(SignalKeyRequest.safeParse(noContext).success, false);
-  assert.equal(SignalKeyRequest.safeParse({ ...key, context: { region: "AU" } }).success, false);
-  assert.equal(SignalKeyRequest.safeParse({ ...key, context: { timeZone: "UTC" } }).success, false);
-  assert.equal(SignalKeyRequest.safeParse({ ...key, context: { ...context, language: "en-AU" } }).success, false);
+  // The 0.3.0 shape, region and time zone only, is refused.
+  assert.equal(SignalKeyRequest.safeParse({ ...key, context: { region: "AU", timeZone: "Australia/Sydney" } }).success, false);
+  for (const field of ["appBuild", "osMajor", "deviceClass", "language", "region", "timeZone", "gapDays"]) {
+    const { [field]: _, ...missing } = context;
+    assert.equal(SignalKeyRequest.safeParse({ ...key, context: missing }).success, false, field);
+  }
+  assert.equal(SignalKeyRequest.safeParse({ ...key, context: { ...context, installId: "x" } }).success, false);
   assert.equal(SignalKeyRequest.safeParse({ ...key, context: { ...context, region: "au" } }).success, false);
   assert.equal(SignalKeyRequest.safeParse({ ...key, context: { ...context, timeZone: "Australia/Syd\u0000" } }).success, false);
   assert.equal(SignalKeyRequest.safeParse({ ...key, keyId: "short" }).success, false);
@@ -227,4 +237,43 @@ test("the program token rule's test vector, as documented at the top of signals.
   assert.equal(weekToken, "zhmS2alIKLI4o5p_Z44tR51pOwfp-XSz");
   assert.equal(monthToken, "Z5hW5C_oDizW5aXx6fhkIVN7gOVGS2Xn");
   assert.equal(PulseDocumentV1.safeParse({ ...pulse, weekToken, monthToken }).success, true);
+});
+
+test("gapDays is null or a whole number from 1 to 30", () => {
+  const key = (gapDays) => ({ challenge: "A".repeat(43), keyId: KEY_ID, attestation: "AAAA", context: { ...doc.context, gapDays } });
+  for (const [gap, ok] of [
+    [null, true],
+    [1, true],
+    [30, true],
+    [0, false],
+    [31, false],
+    [-1, false],
+    [1.5, false],
+    ["3", false],
+    [undefined, false],
+  ]) {
+    assert.equal(SignalKeyRequest.safeParse(key(gap)).success, ok, String(gap));
+  }
+});
+
+test("the phone's gapDays rule, as documented at the top of signals.ts", () => {
+  assert.equal(signalGapDays(null, "2026-10-26"), null);
+  assert.equal(signalGapDays("2026-10-25", "2026-10-26"), 1);
+  assert.equal(signalGapDays("2026-09-26", "2026-10-26"), 30);
+  assert.equal(signalGapDays("2026-01-01", "2026-10-26"), 30);
+  // The clock went back: the history is not trusted.
+  assert.equal(signalGapDays("2026-10-27", "2026-10-26"), null);
+  // Across a month and a year end.
+  assert.equal(signalGapDays("2026-12-31", "2027-01-02"), 2);
+  assert.throws(() => signalGapDays("2026-10-26", "2026-10-26"), RangeError);
+  assert.throws(() => signalGapDays("yesterday", "2026-10-26"), RangeError);
+});
+
+test("the rolling active types sync and broadcast", () => {
+  assert.deepEqual(SYNC_TYPES.slice(-2), ["signal_hour_rollup", "signal_actives"]);
+  assert.equal(EventType.SignalHourRollupUpdated, "signal_hour_rollup.updated");
+  assert.equal(EventType.SignalActivesUpdated, "signal_actives.updated");
+  assert.equal(signalHourRollupId("2026-10-26T10:00:00.000Z", "Australia/Sydney"), "2026-10-26T10:00:00.000Z|Australia/Sydney");
+  assert.equal(signalActivesId("zone", "Europe/Berlin"), "zone|Europe/Berlin");
+  assert.equal(signalActivesId("region", "AU"), "region|AU");
 });

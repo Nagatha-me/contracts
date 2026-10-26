@@ -9,7 +9,8 @@
  *
  * The day key (live pulse model, owner, 26 October 2026)
  * -------------------------------------------------------
- * On the first upload of a day the phone generates an App Attest key
+ * On its first foreground of a UTC day (0.4.0; or its first upload, when that
+ * comes first) the phone generates an App Attest key
  * (`DCAppAttestService.generateKey`), fetches a challenge and attests the key
  * with `clientDataHash = sha256(challengeBytes)`, where `challengeBytes` is the
  * challenge decoded from base64url (32 bytes). `POST /signals/key` verifies the
@@ -18,13 +19,52 @@
  * `expiresAt` (24 hours after the attestation). A key id is attested once; a
  * second attestation of the same key id is 409 CONFLICT.
  *
- * The key request carries `context`, `{ region, timeZone }`, with the same
- * shapes as the document context (0.3.0). On a successful attestation the
- * server adds 1 to `devices` on the rollup for (today UTC, region), in the
- * same transaction that stores the key, and broadcasts the rollup row. The
- * region goes on the rollup only, never on the key row; the time zone is
- * validated and not stored. One key a day per phone makes `devices` the daily
- * active devices per region.
+ * The key request carries `context` (0.4.0): the full document context
+ * (`appBuild`, `osMajor`, `deviceClass`, `language`, `region`, `timeZone`)
+ * plus `gapDays`, the whole UTC days since this phone was last counted active
+ * (1 to 30, 30 meaning 30 or more), or `null` when it has never been counted.
+ * On a successful attestation the server, in the same transaction that stores
+ * the key: adds 1 to `devices` on the daily rollup for (today UTC, region);
+ * adds 1 to `devices` on the hour rollup for (this UTC hour, time zone); adds
+ * 1 to the gap rollup for (today UTC, time zone, gap); recomputes the zone's
+ * and the region's rolling actives (`SignalActivesRow`, rows.ts) from the gap
+ * rollups; and broadcasts the hour rollup and both actives rows. The context
+ * goes on those counters only, never on the key row, and nothing about it is
+ * kept per phone. The gap is one number, never a date, so it says how many
+ * distinct phones were active in a window without linking any two days.
+ *
+ * The phone's rules (0.4.0), exactly:
+ *  - A day is a UTC calendar day, the same day the server counts in. The
+ *    phone attests one key per UTC day, as soon as the app first comes to the
+ *    foreground in that day with sharing on (scene phase `active`), before
+ *    any pulse and without waiting for one, so a person who opens the app is
+ *    counted at once. If the first upload of the day happens in the
+ *    background first (a nag answered from a notification), that upload
+ *    attests the key instead. Never more than one accepted attestation a UTC
+ *    day.
+ *  - It keeps `lastActiveDay`, the UTC day (`YYYY-MM-DD`) of its last
+ *    ACCEPTED attestation, and `lastGapDays`, the gap it sent then, in the
+ *    Keychain beside the install secret: this device only, never backed up,
+ *    never synced, never sent. Both are written only when the server answers
+ *    200 (or 409 CONFLICT, which means that key was already counted). A
+ *    refused or failed attestation changes neither.
+ *  - `gapDays` = `signalGapDays(lastActiveDay, today)`: `null` when there is
+ *    no `lastActiveDay` (first ever, a restore onto a new phone, or after
+ *    "Delete and start fresh", which clears both values with the install
+ *    secret); `null` too when `lastActiveDay` is after today (the clock went
+ *    back: the history is not trusted, and the next accepted attestation
+ *    resets it); otherwise the day difference, capped at 30.
+ *  - A second attestation on the same UTC day (the first key was refused
+ *    later with KEY_UNKNOWN) sends `lastGapDays` again, the gap the day
+ *    started with. The server then counts the phone twice that day; this is
+ *    rare and the cost of keeping no identity.
+ *  - With sharing off the phone attests nothing and keeps its stored day, so
+ *    the gap on its return measures from the last day it was counted.
+ *
+ * Test vectors for `signalGapDays` (also in test/signals.test.mjs):
+ *   (null, 2026-10-26) -> null; (2026-10-25, 2026-10-26) -> 1;
+ *   (2026-09-26, 2026-10-26) -> 30; (2026-01-01, 2026-10-26) -> 30;
+ *   (2026-10-27, 2026-10-26) -> null.
  *
  * Every later upload that day, pulse or program document, fetches a fresh
  * challenge and is signed with that key by an assertion
@@ -95,8 +135,9 @@
  * neither), and `count`, the events of that kind coalesced over one minute
  * (1 to 60). The server stores no pulse row: it adds 1 to the day-and-region
  * rollup's `pulses` and `count` to the kind's counter, records the tokens'
- * first sightings (`newProgramsWeek`, `newProgramsMonth`), then broadcasts
- * the rollup row.
+ * first sightings (`newProgramsWeek`, `newProgramsMonth`), adds 1 to
+ * `pulses` on the hour rollup for (this UTC hour, its time zone) (0.4.0),
+ * then broadcasts both rows.
  *
  * Program documents
  * -----------------
@@ -691,23 +732,48 @@ export interface SignalChallengeResponse {
     challenge: string;
     expiresInSeconds: typeof SIGNAL_CHALLENGE_TTL_SECONDS;
 }
-/** `SignalKeyRequest.context`: the region and time zone, the same shapes as `SignalContext`. */
+/** The cap on `gapDays`: 30 means 30 days or more since the phone was last counted. */
+export declare const SIGNAL_GAP_DAYS_MAX = 30;
+/**
+ * `SignalKeyRequest.context` (0.4.0): the full `SignalContext` plus `gapDays`,
+ * an integer 1 to 30 (days since this phone was last counted active, capped
+ * at 30) or `null` (never counted before). Strict.
+ */
 export declare const SignalKeyContext: z.ZodObject<{
+    gapDays: z.ZodNullable<z.ZodNumber>;
+    appBuild: z.ZodString;
+    osMajor: z.ZodNumber;
+    deviceClass: z.ZodString;
+    language: z.ZodString;
     region: z.ZodString;
     timeZone: z.ZodString;
 }, z.core.$strict>;
 export type SignalKeyContext = z.infer<typeof SignalKeyContext>;
 /**
+ * The phone's `gapDays` for a first attestation on UTC day `today`, from the
+ * UTC day of its last accepted attestation (see "The phone's rules" at the
+ * top). Both days are `YYYY-MM-DD`. `null` for no history or a history in the
+ * future; otherwise the whole days between, capped at 30. Throws when the two
+ * days are equal: a second attestation the same day resends the day's first
+ * gap and never calls this.
+ */
+export declare function signalGapDays(lastActiveDay: string | null, today: string): number | null;
+/**
  * `POST /signals/key` body: attest today's key. The attestation's
  * clientDataHash is `sha256(challengeBytes)`; no document is bound.
- * `context` (0.3.0, required) counts the phone in `devices` for today and its
- * region; the region is kept on the rollup only.
+ * `context` (0.4.0, required) is the full context plus `gapDays`; it counts
+ * the phone in the daily, hourly and rolling active counts, and nowhere else.
  */
 export declare const SignalKeyRequest: z.ZodObject<{
     challenge: z.ZodString;
     keyId: z.ZodString;
     attestation: z.ZodString;
     context: z.ZodObject<{
+        gapDays: z.ZodNullable<z.ZodNumber>;
+        appBuild: z.ZodString;
+        osMajor: z.ZodNumber;
+        deviceClass: z.ZodString;
+        language: z.ZodString;
         region: z.ZodString;
         timeZone: z.ZodString;
     }, z.core.$strict>;

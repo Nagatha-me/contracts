@@ -10,10 +10,10 @@ ESM, TypeScript, `zod` 4 as the only dependency.
 | File | Contents |
 |---|---|
 | `src/events.ts` | `SocketEventName` (`SYNC_DATA`, `SYNC_COMPLETE`, `DIFF_SYNC`, `SYNC_RESET`, `SOCKET_EVENT`, `RPC`), the handshake `{ token, cursor?, scope? }`, `SyncScope`, every payload, the per-entity cursor rule, `EventType`, `verbOf` |
-| `src/rows.ts` | `SyncType` and the row types `UserRow`, `SignalRollupRow` (with `pulses`, the per-kind counters, `devices`, `newProgramsWeek` and `newProgramsMonth`), `SignalNameRollupRow`, plus the rollup id builders |
+| `src/rows.ts` | `SyncType` and the row types `UserRow`, `SignalRollupRow` (with `pulses`, the per-kind counters, `devices`, `newProgramsWeek` and `newProgramsMonth`), `SignalNameRollupRow`, `SignalHourRollupRow` and `SignalActivesRow` (0.4.0, with the rolling window arithmetic), plus the id builders |
 | `src/rpc.ts` | `RpcRequest`, `RpcResponse`, `RpcMethod` (`ping`, `admin.whoami`) with inputs and outputs |
 | `src/auth.ts` | `GET /auth/socket-token` response, `POST /admin/claim` request and response |
-| `src/signals.ts` | The day key and assertion protocol, documented at the top; `SignalDocumentV1` (zod; per-array caps, at most 400 items and 2,000 routine blocks per document, no control characters in any string); `PulseDocumentV1`; the program token rule and `programPeriods`; the `GET /signals/challenge`, `POST /signals/key`, `POST /signals/pulse` and `POST /signals` shapes; `SignalErrorCode` with each code's HTTP status |
+| `src/signals.ts` | The day key and assertion protocol, documented at the top; `SignalDocumentV1` (zod; per-array caps, at most 400 items and 2,000 routine blocks per document, no control characters in any string); `PulseDocumentV1`; the program token rule and `programPeriods`; the `GET /signals/challenge`, `POST /signals/key`, `POST /signals/pulse` and `POST /signals` shapes; the phone's `gapDays` and first-foreground rules and `signalGapDays`; `SignalErrorCode` with each code's HTTP status |
 | `src/errors.ts` | `ErrorCode`, `WireError`, `RestErrorBody` |
 
 ## Rules a client must follow
@@ -44,6 +44,17 @@ ESM, TypeScript, `zod` 4 as the only dependency.
   the live counters: a program document no longer adds its week's
   `nagsShown`, `nagsCompleted`, `runsStarted` or `runsFinished` to the
   rollups.
+- **Signals 0.4.0, rolling actives.** `POST /signals/key` takes the full
+  context (`appBuild`, `osMajor`, `deviceClass`, `language`, `region`,
+  `timeZone`) plus `gapDays`, 1 to 30 or `null`; the 0.3.0 context of region
+  and time zone alone is refused, so 0.3.0 phone builds cannot attest (none
+  shipped). The phone attests on its first foreground of each UTC day and
+  computes `gapDays` by the rules at the top of `src/signals.ts`. Two sync
+  types are added after the existing ones: `signal_hour_rollup` (devices and
+  pulses per UTC hour and time zone, the last 48 hours) and `signal_actives`
+  (rolling 7 and 30 day active phones and new today, per region and per time
+  zone), with `signal_hour_rollup.updated` and `signal_actives.updated`. The
+  live 24 hour figure is the client's to roll from the hour rows.
 
 ## Versioning
 

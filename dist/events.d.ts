@@ -155,6 +155,10 @@ export declare const EventType: {
     readonly UserUpdated: "user.updated";
     readonly SignalRollupUpdated: "signal_rollup.updated";
     readonly SignalNameRollupUpdated: "signal_name_rollup.updated";
+    /** 0.4.0 */
+    readonly SignalHourRollupUpdated: "signal_hour_rollup.updated";
+    /** 0.4.0 */
+    readonly SignalActivesUpdated: "signal_actives.updated";
 };
 export type EventType = (typeof EventType)[keyof typeof EventType];
 /** Derive the verb from an event type's suffix. */

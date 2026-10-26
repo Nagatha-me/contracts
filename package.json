@@ -1,6 +1,6 @@
 {
   "name": "@nagatha/contracts",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Shared Zod schemas and TypeScript types for the Nagatha socket events and REST surfaces.",
   "private": true,
   "type": "module",
