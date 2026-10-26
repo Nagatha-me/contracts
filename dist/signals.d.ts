@@ -6,12 +6,20 @@
  *   POST /signals           SignalUploadRequest -> SignalUploadResponse
  *
  * The phone scrubs the document before it leaves (three layers, on device).
- * This schema is the server's second line: strict keys, bounded arrays, every
- * name capped at 60 characters, every number in a plausible range.
+ * This schema is the server's second line: strict keys, bounded arrays, a cap
+ * on the whole document's items and routine blocks, every name capped at 60
+ * characters, no control characters in any string, every number in a
+ * plausible range.
  */
 import { z } from "zod";
 export declare const SIGNAL_CHALLENGE_TTL_SECONDS = 120;
 export declare const SIGNAL_NAME_MAX = 60;
+/** Across the whole document: items in every stage of every program. */
+export declare const MAX_DOCUMENT_ITEMS = 400;
+/** Across the whole document: routine blocks, counting those inside groups. */
+export declare const MAX_DOCUMENT_ROUTINE_BLOCKS = 2000;
+/** True when `s` holds no C0 control character (U+0000 to U+001F) and no DEL (U+007F). */
+export declare function hasNoControlCharacters(s: string): boolean;
 export declare const SignalContext: z.ZodObject<{
     appBuild: z.ZodString;
     osMajor: z.ZodNumber;

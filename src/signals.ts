@@ -6,8 +6,10 @@
  *   POST /signals           SignalUploadRequest -> SignalUploadResponse
  *
  * The phone scrubs the document before it leaves (three layers, on device).
- * This schema is the server's second line: strict keys, bounded arrays, every
- * name capped at 60 characters, every number in a plausible range.
+ * This schema is the server's second line: strict keys, bounded arrays, a cap
+ * on the whole document's items and routine blocks, every name capped at 60
+ * characters, no control characters in any string, every number in a
+ * plausible range.
  */
 
 import { z } from "zod";
@@ -15,12 +17,30 @@ import { z } from "zod";
 export const SIGNAL_CHALLENGE_TTL_SECONDS = 120;
 export const SIGNAL_NAME_MAX = 60;
 
-const name = z.string().trim().min(1).max(SIGNAL_NAME_MAX);
+/** Across the whole document: items in every stage of every program. */
+export const MAX_DOCUMENT_ITEMS = 400;
+/** Across the whole document: routine blocks, counting those inside groups. */
+export const MAX_DOCUMENT_ROUTINE_BLOCKS = 2_000;
+
+/** True when `s` holds no C0 control character (U+0000 to U+001F) and no DEL (U+007F). */
+export function hasNoControlCharacters(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c <= 0x1f || c === 0x7f) return false;
+  }
+  return true;
+}
+
+const NO_CONTROL = "control characters are not allowed";
+
+/** A string that may not hold control characters; every string field starts here. */
+const text = () => z.string().refine(hasNoControlCharacters, NO_CONTROL);
+
+const name = z.string().trim().min(1).max(SIGNAL_NAME_MAX).refine(hasNoControlCharacters, NO_CONTROL);
 const count = (max: number) => z.number().int().min(0).max(max);
 
 /** `YYYY-MM-DD` that is also a real calendar date. */
-const isoDay = z
-  .string()
+const isoDay = text()
   .regex(/^\d{4}-\d{2}-\d{2}$/)
   .refine((s) => {
     const d = new Date(`${s}T00:00:00Z`);
@@ -28,19 +48,18 @@ const isoDay = z
   }, "not a calendar date");
 
 /** `HH:MM`, 24 hour. */
-const clockTime = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
+const clockTime = text().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
 
 export const SignalContext = z.strictObject({
-  appBuild: z.string().min(1).max(32).regex(/^[A-Za-z0-9._-]+$/),
+  appBuild: text().min(1).max(32).regex(/^[A-Za-z0-9._-]+$/),
   osMajor: z.number().int().min(10).max(60),
-  deviceClass: z.string().min(1).max(32).regex(/^[A-Za-z0-9._-]+$/),
+  deviceClass: text().min(1).max(32).regex(/^[A-Za-z0-9._-]+$/),
   /** BCP 47 language tag, for example `en-AU`. */
-  language: z.string().min(2).max(35).regex(/^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$/),
+  language: text().min(2).max(35).regex(/^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$/),
   /** ISO 3166-1 alpha-2 from the device locale, or `ZZ` when unknown. Never from the IP. */
-  region: z.string().regex(/^[A-Z]{2}$/),
+  region: text().regex(/^[A-Z]{2}$/),
   /** IANA time zone id, for example `Australia/Sydney`. */
-  timeZone: z
-    .string()
+  timeZone: text()
     .min(1)
     .max(64)
     .regex(/^(UTC|GMT|[A-Za-z]+(\/[A-Za-z0-9_+-]+){1,2})$/),
@@ -88,12 +107,15 @@ export type RoutineBlock = z.infer<typeof RoutineBlock>;
 
 export const MAX_ROUTINE_BLOCKS = 30;
 
+/** Blocks in a routine, counting those inside groups. */
+function routineBlockCount(blocks: readonly RoutineBlock[]): number {
+  return blocks.reduce((n, b) => n + 1 + (b.kind === "group" ? b.blocks.length : 0), 0);
+}
+
 export const SignalRoutine = z
   .strictObject({ blocks: z.array(RoutineBlock).min(1).max(MAX_ROUTINE_BLOCKS) })
   .refine(
-    (r) =>
-      r.blocks.reduce((n, b) => n + 1 + (b.kind === "group" ? b.blocks.length : 0), 0) <=
-      MAX_ROUTINE_BLOCKS,
+    (r) => routineBlockCount(r.blocks) <= MAX_ROUTINE_BLOCKS,
     `a routine holds at most ${MAX_ROUTINE_BLOCKS} blocks, counting those inside groups`,
   );
 
@@ -119,11 +141,11 @@ export const ProgramSource = z.enum(["hand", "template", "onboarding", "reminder
 
 export const SignalProgram = z.strictObject({
   /** Random, changes whenever the program changes. Never ties two uploads together. */
-  token: z.string().regex(/^[A-Za-z0-9_-]{16,32}$/),
+  token: text().regex(/^[A-Za-z0-9_-]{16,32}$/),
   name,
   kind: ProgramKind,
   source: ProgramSource,
-  templateId: z.string().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/).optional(),
+  templateId: text().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/).optional(),
   ageWeeks: z.number().int().min(0).max(1040),
   keptAt: z.strictObject({ d7: z.boolean(), d30: z.boolean(), d90: z.boolean() }),
   stages: z.array(SignalStage).min(1).max(10),
@@ -151,12 +173,35 @@ export const SignalEvents = z.strictObject({
   weekday: z.array(count(20_000)).length(7),
 });
 
-export const SignalDocumentV1 = z.strictObject({
-  version: z.literal(1),
-  context: SignalContext,
-  programs: z.array(SignalProgram).max(20),
-  events: SignalEvents,
-});
+export const SignalDocumentV1 = z
+  .strictObject({
+    version: z.literal(1),
+    context: SignalContext,
+    programs: z.array(SignalProgram).max(20),
+    events: SignalEvents,
+  })
+  .superRefine((doc, ctx) => {
+    // The per-array caps alone allow 20 x 10 x 40 items and 30 blocks each;
+    // these bound the whole document, whatever its shape.
+    let items = 0;
+    let blocks = 0;
+    for (const program of doc.programs) {
+      for (const stage of program.stages) {
+        items += stage.items.length;
+        for (const item of stage.items) if (item.routine) blocks += routineBlockCount(item.routine.blocks);
+      }
+    }
+    if (items > MAX_DOCUMENT_ITEMS) {
+      ctx.addIssue({ code: "custom", path: ["programs"], message: `a document holds at most ${MAX_DOCUMENT_ITEMS} items` });
+    }
+    if (blocks > MAX_DOCUMENT_ROUTINE_BLOCKS) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["programs"],
+        message: `a document holds at most ${MAX_DOCUMENT_ROUTINE_BLOCKS} routine blocks, counting those inside groups`,
+      });
+    }
+  });
 export type SignalDocumentV1 = z.infer<typeof SignalDocumentV1>;
 
 /** `GET /signals/challenge` response. */
@@ -177,11 +222,16 @@ export interface SignalChallengeResponse {
  */
 export const SignalUploadRequest = z.strictObject({
   platform: z.enum(["ios", "android"]),
-  challenge: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  challenge: text().regex(/^[A-Za-z0-9_-]{43}$/),
   /** base64 of sha256 of the attested public key, as DCAppAttestService returns it. */
-  keyId: z.string().min(1).max(100),
+  keyId: text().min(1).max(100),
   /** base64 of the CBOR attestation object. */
-  attestation: z.string().min(1).max(20_000),
+  attestation: text().min(1).max(20_000),
+  /**
+   * The one string exempt from the control character rule: JSON text may
+   * carry tabs and newlines between tokens. Every string inside it is checked
+   * once it is parsed as a `SignalDocumentV1`.
+   */
   document: z.string().min(2).max(512 * 1024),
 });
 export type SignalUploadRequest = z.infer<typeof SignalUploadRequest>;

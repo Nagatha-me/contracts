@@ -3,13 +3,29 @@
  *
  * The flow (see `/workspace/ai/ctw/docs/engineering/portal-sync-pattern.md`):
  *
- *  1. The client connects with handshake auth `{ token, cursor? }`.
+ *  1. The client connects with handshake auth `{ token, cursor?, scope? }`.
  *  2. No cursor: the server streams `SYNC_DATA` frames, then `SYNC_COMPLETE`.
  *     A cursor: the server answers `DIFF_SYNC` with every change since it, or
  *     `SYNC_RESET` followed by a full `SYNC_DATA` stream when it cannot.
- *  3. From then on every committed change arrives as `SOCKET_EVENT`, in the
- *     same tick it committed. Components read the store; they never refetch.
+ *  3. Catch-up `SOCKET_EVENT`s may follow the sync; from then on every
+ *     committed change arrives as `SOCKET_EVENT`, in the same tick it
+ *     committed. Components read the store; they never refetch.
  *  4. Calls go out as `RPC` with an ack (`rpc.ts`).
+ *
+ * The per-entity cursor rule (the client MUST follow it):
+ *  - Keep, per entity (`entityKind` plus id), the highest cursor applied to it.
+ *  - Ignore any `SOCKET_EVENT` or `DIFF_SYNC` upserted row whose cursor is
+ *    lower than or equal to the cursor already applied to that entity.
+ *  - A full sync (`SYNC_DATA` rows) is authoritative and carries no per-row
+ *    cursor: on `SYNC_RESET` or a fresh full sync, clear the per-entity
+ *    cursors with the store, and accept the next envelope for each entity.
+ *  - Do not compare an envelope with the global `SYNC_COMPLETE.cursor`.
+ *    Events on different rows can commit out of cursor order, so an envelope
+ *    with a cursor below the global one can still be new. For one row, lock
+ *    order makes cursor order equal state order, which is what the per-entity
+ *    rule relies on.
+ *  - Keep the highest cursor seen overall (from `SYNC_COMPLETE`,
+ *    `DIFF_SYNC.toCursor` or any envelope) to present on the next handshake.
  */
 
 import type { SyncRowByType, SyncType } from "./rows.js";
@@ -32,14 +48,30 @@ export const SocketEventName = {
 export type SocketEventName = (typeof SocketEventName)[keyof typeof SocketEventName];
 
 /**
- * Handshake auth, passed as `io(url, { auth: { token, cursor } })`.
- * `token` comes from `GET /auth/socket-token`. `cursor` is the last
+ * What a connection may see. `admin` is a super admin (the user row plus the
+ * signal rollups); `user` is anyone else (their own user row only).
+ */
+export const SyncScope = {
+  Admin: "admin",
+  User: "user",
+} as const;
+
+export type SyncScope = (typeof SyncScope)[keyof typeof SyncScope];
+
+/**
+ * Handshake auth, passed as `io(url, { auth: { token, cursor, scope } })`.
+ * `token` comes from `GET /auth/socket-token`. `cursor` is the highest
  * `SYNC_COMPLETE.cursor`, `DIFF_SYNC.toCursor` or `SOCKET_EVENT.cursor` the
- * client applied; omit it for a cold start.
+ * client has seen; omit it for a cold start. `scope` is the
+ * `SYNC_COMPLETE.scope` the stored state was built under; send it with every
+ * cursor. When it differs from the connection's scope now, or a cursor comes
+ * without it, the server answers `SYNC_RESET { reason: "scope_changed" }` and
+ * a full sync, so a cache built under another scope never survives.
  */
 export interface SocketHandshakeAuth {
   token: string;
   cursor?: string;
+  scope?: SyncScope;
 }
 
 /**
@@ -55,18 +87,28 @@ export interface SyncDataFrame<T extends SyncType = SyncType> {
   total: number;
 }
 
-/** `SYNC_COMPLETE`: keep `cursor` and present it on the next handshake. */
+/** `SYNC_COMPLETE`: keep `cursor` and `scope` and present both on the next handshake. */
 export interface SyncCompletePayload {
   cursor: string;
+  /** The scope this sync was built under. */
+  scope: SyncScope;
   /** Server time spent producing the sync, for the client's own timing. */
   serverElapsedMs: number;
   /** Rows sent per type, counted in the stream. */
   counts: Partial<Record<SyncType, number>>;
 }
 
+/**
+ * A `DIFF_SYNC` upserted row: the full canonical row plus `cursor`, the cursor
+ * of the event that produced this state. Apply it under the per-entity cursor
+ * rule above, and strip `cursor` before storing the row if the slice keeps
+ * rows in their canonical shape.
+ */
+export type DiffUpsertedRow<T extends SyncType = SyncType> = SyncRowByType[T] & { cursor: string };
+
 /** One type's share of a `DIFF_SYNC`. `removed` holds ids. */
 export interface DiffSyncTypeChanges<T extends SyncType = SyncType> {
-  upserted: SyncRowByType[T][];
+  upserted: DiffUpsertedRow<T>[];
   removed: string[];
 }
 
@@ -91,7 +133,10 @@ export const SyncResetReason = {
 
 export type SyncResetReason = (typeof SyncResetReason)[keyof typeof SyncResetReason];
 
-/** `SYNC_RESET`: discard local state; a full `SYNC_DATA` stream follows on this socket. */
+/**
+ * `SYNC_RESET`: discard local state and the per-entity cursors; a full
+ * `SYNC_DATA` stream follows on this socket.
+ */
 export interface SyncResetPayload {
   reason: SyncResetReason;
 }
@@ -101,7 +146,9 @@ export type SocketEventVerb = "CREATED" | "UPDATED" | "DELETED" | "OTHER";
 /**
  * `SOCKET_EVENT`: one committed change. `data` is the FULL canonical row for
  * `entityKind` (the same shape as `SYNC_DATA`), or `{ id }` when `verb` is
- * `DELETED`. Upsert by `entityId`; a duplicate arrival is a harmless no-op.
+ * `DELETED`. Upsert by `entityId` under the per-entity cursor rule at the top
+ * of this file: ignore it when its cursor is lower than or equal to the
+ * highest cursor already applied to that entity.
  */
 export interface SocketEventEnvelope<T extends SyncType = SyncType> {
   /** The event type, `"<entityKind>.<verb lower case>"`, for example `signal_rollup.updated`. */

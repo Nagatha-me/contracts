@@ -1,6 +1,6 @@
 {
   "name": "@nagatha/contracts",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shared Zod schemas and TypeScript types for the Nagatha socket events and REST surfaces.",
   "private": true,
   "type": "module",
@@ -22,6 +22,7 @@
   "scripts": {
     "build": "tsc",
     "typecheck": "tsc --noEmit",
+    "lint": "tsc --noEmit",
     "test": "tsc && node --test test/",
     "clean": "rm -rf dist",
     "prepare": "tsc",

@@ -3,13 +3,29 @@
  *
  * The flow (see `/workspace/ai/ctw/docs/engineering/portal-sync-pattern.md`):
  *
- *  1. The client connects with handshake auth `{ token, cursor? }`.
+ *  1. The client connects with handshake auth `{ token, cursor?, scope? }`.
  *  2. No cursor: the server streams `SYNC_DATA` frames, then `SYNC_COMPLETE`.
  *     A cursor: the server answers `DIFF_SYNC` with every change since it, or
  *     `SYNC_RESET` followed by a full `SYNC_DATA` stream when it cannot.
- *  3. From then on every committed change arrives as `SOCKET_EVENT`, in the
- *     same tick it committed. Components read the store; they never refetch.
+ *  3. Catch-up `SOCKET_EVENT`s may follow the sync; from then on every
+ *     committed change arrives as `SOCKET_EVENT`, in the same tick it
+ *     committed. Components read the store; they never refetch.
  *  4. Calls go out as `RPC` with an ack (`rpc.ts`).
+ *
+ * The per-entity cursor rule (the client MUST follow it):
+ *  - Keep, per entity (`entityKind` plus id), the highest cursor applied to it.
+ *  - Ignore any `SOCKET_EVENT` or `DIFF_SYNC` upserted row whose cursor is
+ *    lower than or equal to the cursor already applied to that entity.
+ *  - A full sync (`SYNC_DATA` rows) is authoritative and carries no per-row
+ *    cursor: on `SYNC_RESET` or a fresh full sync, clear the per-entity
+ *    cursors with the store, and accept the next envelope for each entity.
+ *  - Do not compare an envelope with the global `SYNC_COMPLETE.cursor`.
+ *    Events on different rows can commit out of cursor order, so an envelope
+ *    with a cursor below the global one can still be new. For one row, lock
+ *    order makes cursor order equal state order, which is what the per-entity
+ *    rule relies on.
+ *  - Keep the highest cursor seen overall (from `SYNC_COMPLETE`,
+ *    `DIFF_SYNC.toCursor` or any envelope) to present on the next handshake.
  */
 export const SocketEventName = {
     /** Server to client: one frame of rows for one sync type. */
@@ -24,6 +40,14 @@ export const SocketEventName = {
     SocketEvent: "SOCKET_EVENT",
     /** Client to server: an RPC call with an ack callback. */
     Rpc: "RPC",
+};
+/**
+ * What a connection may see. `admin` is a super admin (the user row plus the
+ * signal rollups); `user` is anyone else (their own user row only).
+ */
+export const SyncScope = {
+    Admin: "admin",
+    User: "user",
 };
 export const SyncResetReason = {
     /** The cursor is older than the retained event window (30 days). */

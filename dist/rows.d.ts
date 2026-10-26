@@ -28,6 +28,12 @@ export interface UserRow {
 /**
  * Upload totals for one UTC day and one region. Super admins only.
  * `id` is `${day}|${region}`.
+ *
+ * `programs` counts programs UPLOADED that day: the sum of each document's
+ * program count. The same program sent in two uploads counts twice, so it is
+ * not a count of unique programs. Unique programs come later, with the
+ * program token dedupe of design section 8; this column keeps its name and
+ * its meaning when that lands.
  */
 export interface SignalRollupRow {
     id: string;
