@@ -26,23 +26,34 @@ export interface UserRow {
     updatedAt: string;
 }
 /**
- * Upload totals for one UTC day and one region. Super admins only.
+ * Totals for one UTC day and one region. Super admins only.
  * `id` is `${day}|${region}`.
  *
  * `programs` counts programs UPLOADED that day: the sum of each document's
  * program count. The same program sent in two uploads counts twice, so it is
- * not a count of unique programs. Unique programs come later, with the
- * program token dedupe of design section 8; this column keeps its name and
- * its meaning when that lands.
+ * not a count of unique programs; `newProgramsWeek` and `newProgramsMonth`
+ * are the unique counts.
  *
  * `uploads` counts program documents (`POST /signals`); `pulses` counts
- * accepted pulses (`POST /signals/pulse`). The per-kind counters add each
- * pulse's `count`: run.started to `runsStarted`, run.finished to
- * `runsFinished`, nag.shown to `nagsShown`, nag.completed to `nagsCompleted`,
- * nag.snoozed to `snoozes`, nag.skipped to `skips`, line.shared to `shares`,
- * line.laughed to `laughs`. A program document also adds its week's
- * `nagsShown`, `nagsCompleted`, `runsStarted` and `runsFinished`, as before
- * 0.2.0; it does not touch `pulses` or the four counters added in 0.2.0.
+ * accepted pulses (`POST /signals/pulse`); `devices` counts day keys attested
+ * (`POST /signals/key`), one per phone per day, so it is the day's active
+ * devices in the region (0.3.0).
+ *
+ * Pulses own the live counters (0.3.0). Each pulse adds its `count`:
+ * run.started to `runsStarted`, run.finished to `runsFinished`, nag.shown to
+ * `nagsShown`, nag.completed to `nagsCompleted`, nag.snoozed to `snoozes`,
+ * nag.skipped to `skips`, line.shared to `shares`, line.laughed to `laughs`.
+ * A program document no longer adds its week's counts to any of these; it
+ * adds `uploads` and `programs` only, and its counts stay in the stored
+ * document.
+ *
+ * `newProgramsWeek` and `newProgramsMonth` (0.3.0) count first sightings: a
+ * program's week token (or month token), from a pulse or a document, seen for
+ * the first time in its UTC ISO week (or UTC month), counted on the day and
+ * in the region of that first sighting. Summed over the days of one ISO week,
+ * `newProgramsWeek` is the number of programs active that week; summed over
+ * one month, `newProgramsMonth` is the number active that month. A sum over
+ * any other window means nothing.
  */
 export interface SignalRollupRow {
     id: string;
@@ -64,6 +75,12 @@ export interface SignalRollupRow {
     shares: number;
     /** From pulses only (0.2.0). */
     laughs: number;
+    /** Day keys attested: active devices (0.3.0). */
+    devices: number;
+    /** Week tokens first seen in their ISO week (0.3.0). */
+    newProgramsWeek: number;
+    /** Month tokens first seen in their month (0.3.0). */
+    newProgramsMonth: number;
     updatedAt: string;
 }
 /**

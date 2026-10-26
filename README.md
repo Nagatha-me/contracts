@@ -10,10 +10,10 @@ ESM, TypeScript, `zod` 4 as the only dependency.
 | File | Contents |
 |---|---|
 | `src/events.ts` | `SocketEventName` (`SYNC_DATA`, `SYNC_COMPLETE`, `DIFF_SYNC`, `SYNC_RESET`, `SOCKET_EVENT`, `RPC`), the handshake `{ token, cursor?, scope? }`, `SyncScope`, every payload, the per-entity cursor rule, `EventType`, `verbOf` |
-| `src/rows.ts` | `SyncType` and the row types `UserRow`, `SignalRollupRow` (with `pulses` and the per-kind counters), `SignalNameRollupRow`, plus the rollup id builders |
+| `src/rows.ts` | `SyncType` and the row types `UserRow`, `SignalRollupRow` (with `pulses`, the per-kind counters, `devices`, `newProgramsWeek` and `newProgramsMonth`), `SignalNameRollupRow`, plus the rollup id builders |
 | `src/rpc.ts` | `RpcRequest`, `RpcResponse`, `RpcMethod` (`ping`, `admin.whoami`) with inputs and outputs |
 | `src/auth.ts` | `GET /auth/socket-token` response, `POST /admin/claim` request and response |
-| `src/signals.ts` | The day key and assertion protocol, documented at the top; `SignalDocumentV1` (zod; per-array caps, at most 400 items and 2,000 routine blocks per document, no control characters in any string); `PulseDocumentV1`; the `GET /signals/challenge`, `POST /signals/key`, `POST /signals/pulse` and `POST /signals` shapes; `SignalErrorCode` with each code's HTTP status |
+| `src/signals.ts` | The day key and assertion protocol, documented at the top; `SignalDocumentV1` (zod; per-array caps, at most 400 items and 2,000 routine blocks per document, no control characters in any string); `PulseDocumentV1`; the program token rule and `programPeriods`; the `GET /signals/challenge`, `POST /signals/key`, `POST /signals/pulse` and `POST /signals` shapes; `SignalErrorCode` with each code's HTTP status |
 | `src/errors.ts` | `ErrorCode`, `WireError`, `RestErrorBody` |
 
 ## Rules a client must follow
@@ -28,13 +28,22 @@ ESM, TypeScript, `zod` 4 as the only dependency.
   handshake. A cursor without a scope, or with a scope that no longer
   matches, is answered with `SYNC_RESET { reason: "scope_changed" }`.
 - **`programs` in `SignalRollupRow`** counts programs uploaded (the sum of
-  each document's program count), not unique programs. Unique programs come
-  later, with the program token dedupe of design section 8.
+  each document's program count), not unique programs. Unique programs are
+  `newProgramsWeek` summed over one ISO week and `newProgramsMonth` summed
+  over one month (0.3.0).
 
 - **Signals 0.2.0.** `POST /signals` is signed with the day key by an App
   Attest assertion; the per-upload attestation of 0.1 is gone. Attest the
   day's key with `POST /signals/key` first. The whole protocol is at the top of
   `src/signals.ts`.
+- **Signals 0.3.0.** `POST /signals/key` takes `context` (`{ region,
+  timeZone }`) and counts the phone in the rollup's `devices`. The stable
+  program token is gone: programs and run pulses carry `weekToken` and
+  `monthToken`, derived on the phone by the rule at the top of
+  `src/signals.ts`, so nothing links two uploads across a month. Pulses own
+  the live counters: a program document no longer adds its week's
+  `nagsShown`, `nagsCompleted`, `runsStarted` or `runsFinished` to the
+  rollups.
 
 ## Versioning
 

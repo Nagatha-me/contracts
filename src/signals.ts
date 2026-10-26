@@ -18,6 +18,14 @@
  * `expiresAt` (24 hours after the attestation). A key id is attested once; a
  * second attestation of the same key id is 409 CONFLICT.
  *
+ * The key request carries `context`, `{ region, timeZone }`, with the same
+ * shapes as the document context (0.3.0). On a successful attestation the
+ * server adds 1 to `devices` on the rollup for (today UTC, region), in the
+ * same transaction that stores the key, and broadcasts the rollup row. The
+ * region goes on the rollup only, never on the key row; the time zone is
+ * validated and not stored. One key a day per phone makes `devices` the daily
+ * active devices per region.
+ *
  * Every later upload that day, pulse or program document, fetches a fresh
  * challenge and is signed with that key by an assertion
  * (`DCAppAttestService.generateAssertion(keyId, clientDataHash)`) over
@@ -42,13 +50,53 @@
  * next key. On COUNTER_REPLAY it drops that upload. When the endpoint is away,
  * pulses are queued on the phone and dropped after seven days.
  *
+ * Program tokens (0.3.0)
+ * ----------------------
+ * A program carries two rotating tokens, `weekToken` and `monthToken`, in
+ * place of the stable token of 0.2.0. The phone derives them; this is its
+ * rule, exactly:
+ *
+ *   weekToken  = base64url(sha256(installSecret || programId || week))[0..<32]
+ *   monthToken = base64url(sha256(installSecret || programId || month))[0..<32]
+ *
+ *  - `installSecret`: 32 random bytes made once per install with the system's
+ *    secure random generator, kept in the Keychain on this device only, never
+ *    sent, never backed up, never synced. "Delete and start fresh" makes a new
+ *    one.
+ *  - `programId`: the UTF-8 bytes of the program's id as the phone stores it
+ *    (Swift `UUID.uuidString`, upper case with hyphens).
+ *  - `week`: the ISO 8601 week of the moment the upload is built, in UTC, as
+ *    ASCII `YYYY-Www` (ISO week-numbering year, `W`, two-digit week), for
+ *    example `2026-W44`. `month`: the UTC calendar month, `YYYY-MM`, for
+ *    example `2026-10`. `programPeriods` below computes both.
+ *  - `||` is byte concatenation with no separator. sha256 gives 32 bytes;
+ *    base64url is RFC 4648 section 5 without padding (43 characters); the
+ *    token is its first 32 characters.
+ *
+ * Test vector (also in test/signals.test.mjs): installSecret = 32 bytes of
+ * 0x01, programId = `3F2504E0-4F89-41D3-9D0A-0305E82C3301`:
+ *   week `2026-W44` -> `zhmS2alIKLI4o5p_Z44tR51pOwfp-XSz`
+ *   month `2026-10` -> `Z5hW5C_oDizW5aXx6fhkIVN7gOVGS2Xn`
+ *
+ * The tokens are derived when the upload is sent, not when the event
+ * happened, so a pulse queued over a week boundary carries the tokens of the
+ * week it is sent in. The server takes the periods from its own UTC clock at
+ * receipt. A token is stable for one program within one period and nothing
+ * links it to the next period's token, so nothing links two uploads across a
+ * calendar month. The server keeps only sha256 of each token, with its period
+ * and the region it was first seen in, and deletes it two periods later.
+ * The schema accepts 22 to 44 base64url characters so the length can change
+ * without a contract break.
+ *
  * Pulses
  * ------
  * A pulse is a `PulseDocumentV1`: one event kind, the local hour and weekday,
- * the context, a program token for a run, and `count`, the events of that
- * kind coalesced over one minute (1 to 60). The server stores no pulse row:
- * it adds 1 to the day-and-region rollup's `pulses` and `count` to the kind's
- * counter, then broadcasts the rollup row.
+ * the context, the program's `weekToken` and `monthToken` for a run (both or
+ * neither), and `count`, the events of that kind coalesced over one minute
+ * (1 to 60). The server stores no pulse row: it adds 1 to the day-and-region
+ * rollup's `pulses` and `count` to the kind's counter, records the tokens'
+ * first sightings (`newProgramsWeek`, `newProgramsMonth`), then broadcasts
+ * the rollup row.
  *
  * Program documents
  * -----------------
@@ -58,6 +106,14 @@
  * bounded arrays, a cap on the whole document's items and routine blocks,
  * every name capped at 60 characters, no control characters in any string,
  * every number in a plausible range.
+ *
+ * Pulses own the live counters (0.3.0). A program document is stored whole,
+ * with its weekly counts and histograms, and adds to the rollup only
+ * `uploads` (1), `programs` (its program count), the name rollups and the
+ * first sightings of its programs' tokens. Its weekly `nagsShown`,
+ * `nagsCompleted`, `runsStarted` and `runsFinished` are NOT added to the
+ * rollup any more, so a run reported by a pulse and again in the week's
+ * document counts once.
  *
  * Error codes (beside 429 RATE_LIMITED from the per-IP limiter): INVALID,
  * CHALLENGE_INVALID, DOCUMENT_INVALID, ATTESTATION_INVALID, ASSERTION_INVALID
@@ -80,6 +136,29 @@ export const SIGNAL_NAME_MAX = 60;
 export const MAX_DOCUMENT_ITEMS = 400;
 /** Across the whole document: routine blocks, counting those inside groups. */
 export const MAX_DOCUMENT_ROUTINE_BLOCKS = 2_000;
+
+/** The program token periods for an instant, both in UTC (see "Program tokens" at the top). */
+export interface ProgramPeriods {
+  /** ISO 8601 week, `YYYY-Www`, for example `2026-W44`. */
+  week: string;
+  /** Calendar month, `YYYY-MM`, for example `2026-10`. */
+  month: string;
+}
+
+/** The UTC ISO week and UTC month of `at`, as the program tokens use them. */
+export function programPeriods(at: Date): ProgramPeriods {
+  const day = new Date(Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate()));
+  // ISO weeks start on Monday; the week belongs to the year of its Thursday.
+  const weekday = day.getUTCDay() === 0 ? 7 : day.getUTCDay();
+  const thursday = new Date(day.getTime() + (4 - weekday) * 86_400_000);
+  const isoYear = thursday.getUTCFullYear();
+  const week = Math.floor((thursday.getTime() - Date.UTC(isoYear, 0, 1)) / (7 * 86_400_000)) + 1;
+  const month = at.getUTCMonth() + 1;
+  return {
+    week: `${isoYear}-W${String(week).padStart(2, "0")}`,
+    month: `${at.getUTCFullYear()}-${String(month).padStart(2, "0")}`,
+  };
+}
 
 /** True when `s` holds no C0 control character (U+0000 to U+001F) and no DEL (U+007F). */
 export function hasNoControlCharacters(s: string): boolean {
@@ -109,19 +188,22 @@ const isoDay = text()
 /** `HH:MM`, 24 hour. */
 const clockTime = text().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
 
+/** ISO 3166-1 alpha-2 from the device locale, or `ZZ` when unknown. Never from the IP. */
+const regionCode = text().regex(/^[A-Z]{2}$/);
+/** IANA time zone id, for example `Australia/Sydney`. */
+const timeZoneId = text()
+  .min(1)
+  .max(64)
+  .regex(/^(UTC|GMT|[A-Za-z]+(\/[A-Za-z0-9_+-]+){1,2})$/);
+
 export const SignalContext = z.strictObject({
   appBuild: text().min(1).max(32).regex(/^[A-Za-z0-9._-]+$/),
   osMajor: z.number().int().min(10).max(60),
   deviceClass: text().min(1).max(32).regex(/^[A-Za-z0-9._-]+$/),
   /** BCP 47 language tag, for example `en-AU`. */
   language: text().min(2).max(35).regex(/^[A-Za-z]{2,3}(-[A-Za-z0-9]{1,8})*$/),
-  /** ISO 3166-1 alpha-2 from the device locale, or `ZZ` when unknown. Never from the IP. */
-  region: text().regex(/^[A-Z]{2}$/),
-  /** IANA time zone id, for example `Australia/Sydney`. */
-  timeZone: text()
-    .min(1)
-    .max(64)
-    .regex(/^(UTC|GMT|[A-Za-z]+(\/[A-Za-z0-9_+-]+){1,2})$/),
+  region: regionCode,
+  timeZone: timeZoneId,
 });
 export type SignalContext = z.infer<typeof SignalContext>;
 
@@ -198,9 +280,14 @@ export const SignalStage = z.strictObject({
 export const ProgramKind = z.enum(["rehab", "habit", "routine", "project", "quit", "custom"]);
 export const ProgramSource = z.enum(["hand", "template", "onboarding", "reminders", "sheet"]);
 
+/** A rotating program token (see "Program tokens" at the top): 22 to 44 base64url characters. */
+const programToken = text().regex(/^[A-Za-z0-9_-]{22,44}$/);
+
 export const SignalProgram = z.strictObject({
-  /** Random, changes whenever the program changes. Never ties two uploads together. */
-  token: text().regex(/^[A-Za-z0-9_-]{16,32}$/),
+  /** This program's token for the current UTC ISO week. */
+  weekToken: programToken,
+  /** This program's token for the current UTC month. */
+  monthToken: programToken,
   name,
   kind: ProgramKind,
   source: ProgramSource,
@@ -267,7 +354,7 @@ export type SignalDocumentV1 = z.infer<typeof SignalDocumentV1>;
 // Pulses
 // ------------------------------------------------------------
 
-/** The event kinds a pulse may carry. `run.*` kinds may carry a program token. */
+/** The event kinds a pulse may carry. `run.*` kinds may carry the program tokens. */
 export const PulseKind = z.enum([
   "run.finished",
   "run.started",
@@ -279,9 +366,6 @@ export const PulseKind = z.enum([
   "line.laughed",
 ]);
 export type PulseKind = z.infer<typeof PulseKind>;
-
-/** The program token's shape, the same as `SignalProgram.token`. */
-const programToken = text().regex(/^[A-Za-z0-9_-]{16,32}$/);
 
 export const PulseDocumentV1 = z
   .strictObject({
@@ -296,14 +380,21 @@ export const PulseDocumentV1 = z
       weekday: z.number().int().min(0).max(6),
     }),
     context: SignalContext,
-    /** The program's current random token, for `run.*` kinds only. Never on any other kind. */
-    programToken: programToken.optional(),
+    /** The program's week token, for `run.*` kinds only, always with `monthToken`. */
+    weekToken: programToken.optional(),
+    /** The program's month token, for `run.*` kinds only, always with `weekToken`. */
+    monthToken: programToken.optional(),
     /** Events of this kind coalesced over one minute. */
     count: z.number().int().min(1).max(PULSE_COUNT_MAX),
   })
   .superRefine((doc, ctx) => {
-    if (doc.programToken !== undefined && !doc.kind.startsWith("run.")) {
-      ctx.addIssue({ code: "custom", path: ["programToken"], message: "a program token rides only on run kinds" });
+    const week = doc.weekToken !== undefined;
+    const month = doc.monthToken !== undefined;
+    if ((week || month) && !doc.kind.startsWith("run.")) {
+      ctx.addIssue({ code: "custom", path: [week ? "weekToken" : "monthToken"], message: "program tokens ride only on run kinds" });
+    }
+    if (week !== month) {
+      ctx.addIssue({ code: "custom", path: [week ? "monthToken" : "weekToken"], message: "the week and month tokens go together" });
     }
   });
 export type PulseDocumentV1 = z.infer<typeof PulseDocumentV1>;
@@ -332,15 +423,25 @@ const documentText = (max: number) => z.string().min(2).max(max);
 /** base64 of the CBOR assertion object `{ signature, authenticatorData }`. */
 const assertion = text().min(1).max(4_096);
 
+/** `SignalKeyRequest.context`: the region and time zone, the same shapes as `SignalContext`. */
+export const SignalKeyContext = z.strictObject({
+  region: regionCode,
+  timeZone: timeZoneId,
+});
+export type SignalKeyContext = z.infer<typeof SignalKeyContext>;
+
 /**
  * `POST /signals/key` body: attest today's key. The attestation's
  * clientDataHash is `sha256(challengeBytes)`; no document is bound.
+ * `context` (0.3.0, required) counts the phone in `devices` for today and its
+ * region; the region is kept on the rollup only.
  */
 export const SignalKeyRequest = z.strictObject({
   challenge,
   keyId,
   /** base64 of the CBOR attestation object. */
   attestation: text().min(1).max(20_000),
+  context: SignalKeyContext,
 });
 export type SignalKeyRequest = z.infer<typeof SignalKeyRequest>;
 

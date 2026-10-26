@@ -18,6 +18,14 @@
  * `expiresAt` (24 hours after the attestation). A key id is attested once; a
  * second attestation of the same key id is 409 CONFLICT.
  *
+ * The key request carries `context`, `{ region, timeZone }`, with the same
+ * shapes as the document context (0.3.0). On a successful attestation the
+ * server adds 1 to `devices` on the rollup for (today UTC, region), in the
+ * same transaction that stores the key, and broadcasts the rollup row. The
+ * region goes on the rollup only, never on the key row; the time zone is
+ * validated and not stored. One key a day per phone makes `devices` the daily
+ * active devices per region.
+ *
  * Every later upload that day, pulse or program document, fetches a fresh
  * challenge and is signed with that key by an assertion
  * (`DCAppAttestService.generateAssertion(keyId, clientDataHash)`) over
@@ -42,13 +50,53 @@
  * next key. On COUNTER_REPLAY it drops that upload. When the endpoint is away,
  * pulses are queued on the phone and dropped after seven days.
  *
+ * Program tokens (0.3.0)
+ * ----------------------
+ * A program carries two rotating tokens, `weekToken` and `monthToken`, in
+ * place of the stable token of 0.2.0. The phone derives them; this is its
+ * rule, exactly:
+ *
+ *   weekToken  = base64url(sha256(installSecret || programId || week))[0..<32]
+ *   monthToken = base64url(sha256(installSecret || programId || month))[0..<32]
+ *
+ *  - `installSecret`: 32 random bytes made once per install with the system's
+ *    secure random generator, kept in the Keychain on this device only, never
+ *    sent, never backed up, never synced. "Delete and start fresh" makes a new
+ *    one.
+ *  - `programId`: the UTF-8 bytes of the program's id as the phone stores it
+ *    (Swift `UUID.uuidString`, upper case with hyphens).
+ *  - `week`: the ISO 8601 week of the moment the upload is built, in UTC, as
+ *    ASCII `YYYY-Www` (ISO week-numbering year, `W`, two-digit week), for
+ *    example `2026-W44`. `month`: the UTC calendar month, `YYYY-MM`, for
+ *    example `2026-10`. `programPeriods` below computes both.
+ *  - `||` is byte concatenation with no separator. sha256 gives 32 bytes;
+ *    base64url is RFC 4648 section 5 without padding (43 characters); the
+ *    token is its first 32 characters.
+ *
+ * Test vector (also in test/signals.test.mjs): installSecret = 32 bytes of
+ * 0x01, programId = `3F2504E0-4F89-41D3-9D0A-0305E82C3301`:
+ *   week `2026-W44` -> `zhmS2alIKLI4o5p_Z44tR51pOwfp-XSz`
+ *   month `2026-10` -> `Z5hW5C_oDizW5aXx6fhkIVN7gOVGS2Xn`
+ *
+ * The tokens are derived when the upload is sent, not when the event
+ * happened, so a pulse queued over a week boundary carries the tokens of the
+ * week it is sent in. The server takes the periods from its own UTC clock at
+ * receipt. A token is stable for one program within one period and nothing
+ * links it to the next period's token, so nothing links two uploads across a
+ * calendar month. The server keeps only sha256 of each token, with its period
+ * and the region it was first seen in, and deletes it two periods later.
+ * The schema accepts 22 to 44 base64url characters so the length can change
+ * without a contract break.
+ *
  * Pulses
  * ------
  * A pulse is a `PulseDocumentV1`: one event kind, the local hour and weekday,
- * the context, a program token for a run, and `count`, the events of that
- * kind coalesced over one minute (1 to 60). The server stores no pulse row:
- * it adds 1 to the day-and-region rollup's `pulses` and `count` to the kind's
- * counter, then broadcasts the rollup row.
+ * the context, the program's `weekToken` and `monthToken` for a run (both or
+ * neither), and `count`, the events of that kind coalesced over one minute
+ * (1 to 60). The server stores no pulse row: it adds 1 to the day-and-region
+ * rollup's `pulses` and `count` to the kind's counter, records the tokens'
+ * first sightings (`newProgramsWeek`, `newProgramsMonth`), then broadcasts
+ * the rollup row.
  *
  * Program documents
  * -----------------
@@ -58,6 +106,14 @@
  * bounded arrays, a cap on the whole document's items and routine blocks,
  * every name capped at 60 characters, no control characters in any string,
  * every number in a plausible range.
+ *
+ * Pulses own the live counters (0.3.0). A program document is stored whole,
+ * with its weekly counts and histograms, and adds to the rollup only
+ * `uploads` (1), `programs` (its program count), the name rollups and the
+ * first sightings of its programs' tokens. Its weekly `nagsShown`,
+ * `nagsCompleted`, `runsStarted` and `runsFinished` are NOT added to the
+ * rollup any more, so a run reported by a pulse and again in the week's
+ * document counts once.
  *
  * Error codes (beside 429 RATE_LIMITED from the per-IP limiter): INVALID,
  * CHALLENGE_INVALID, DOCUMENT_INVALID, ATTESTATION_INVALID, ASSERTION_INVALID
@@ -77,6 +133,15 @@ export declare const SIGNAL_NAME_MAX = 60;
 export declare const MAX_DOCUMENT_ITEMS = 400;
 /** Across the whole document: routine blocks, counting those inside groups. */
 export declare const MAX_DOCUMENT_ROUTINE_BLOCKS = 2000;
+/** The program token periods for an instant, both in UTC (see "Program tokens" at the top). */
+export interface ProgramPeriods {
+    /** ISO 8601 week, `YYYY-Www`, for example `2026-W44`. */
+    week: string;
+    /** Calendar month, `YYYY-MM`, for example `2026-10`. */
+    month: string;
+}
+/** The UTC ISO week and UTC month of `at`, as the program tokens use them. */
+export declare function programPeriods(at: Date): ProgramPeriods;
 /** True when `s` holds no C0 control character (U+0000 to U+001F) and no DEL (U+007F). */
 export declare function hasNoControlCharacters(s: string): boolean;
 export declare const SignalContext: z.ZodObject<{
@@ -331,7 +396,8 @@ export declare const ProgramSource: z.ZodEnum<{
     sheet: "sheet";
 }>;
 export declare const SignalProgram: z.ZodObject<{
-    token: z.ZodString;
+    weekToken: z.ZodString;
+    monthToken: z.ZodString;
     name: z.ZodString;
     kind: z.ZodEnum<{
         custom: "custom";
@@ -465,7 +531,8 @@ export declare const SignalDocumentV1: z.ZodObject<{
         timeZone: z.ZodString;
     }, z.core.$strict>;
     programs: z.ZodArray<z.ZodObject<{
-        token: z.ZodString;
+        weekToken: z.ZodString;
+        monthToken: z.ZodString;
         name: z.ZodString;
         kind: z.ZodEnum<{
             custom: "custom";
@@ -577,7 +644,7 @@ export declare const SignalDocumentV1: z.ZodObject<{
     }, z.core.$strict>;
 }, z.core.$strict>;
 export type SignalDocumentV1 = z.infer<typeof SignalDocumentV1>;
-/** The event kinds a pulse may carry. `run.*` kinds may carry a program token. */
+/** The event kinds a pulse may carry. `run.*` kinds may carry the program tokens. */
 export declare const PulseKind: z.ZodEnum<{
     "run.finished": "run.finished";
     "run.started": "run.started";
@@ -613,7 +680,8 @@ export declare const PulseDocumentV1: z.ZodObject<{
         region: z.ZodString;
         timeZone: z.ZodString;
     }, z.core.$strict>;
-    programToken: z.ZodOptional<z.ZodString>;
+    weekToken: z.ZodOptional<z.ZodString>;
+    monthToken: z.ZodOptional<z.ZodString>;
     count: z.ZodNumber;
 }, z.core.$strict>;
 export type PulseDocumentV1 = z.infer<typeof PulseDocumentV1>;
@@ -623,14 +691,26 @@ export interface SignalChallengeResponse {
     challenge: string;
     expiresInSeconds: typeof SIGNAL_CHALLENGE_TTL_SECONDS;
 }
+/** `SignalKeyRequest.context`: the region and time zone, the same shapes as `SignalContext`. */
+export declare const SignalKeyContext: z.ZodObject<{
+    region: z.ZodString;
+    timeZone: z.ZodString;
+}, z.core.$strict>;
+export type SignalKeyContext = z.infer<typeof SignalKeyContext>;
 /**
  * `POST /signals/key` body: attest today's key. The attestation's
  * clientDataHash is `sha256(challengeBytes)`; no document is bound.
+ * `context` (0.3.0, required) counts the phone in `devices` for today and its
+ * region; the region is kept on the rollup only.
  */
 export declare const SignalKeyRequest: z.ZodObject<{
     challenge: z.ZodString;
     keyId: z.ZodString;
     attestation: z.ZodString;
+    context: z.ZodObject<{
+        region: z.ZodString;
+        timeZone: z.ZodString;
+    }, z.core.$strict>;
 }, z.core.$strict>;
 export type SignalKeyRequest = z.infer<typeof SignalKeyRequest>;
 /** `POST /signals/key` success. */
