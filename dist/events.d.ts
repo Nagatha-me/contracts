@@ -159,6 +159,8 @@ export declare const EventType: {
     readonly SignalHourRollupUpdated: "signal_hour_rollup.updated";
     /** 0.4.0 */
     readonly SignalActivesUpdated: "signal_actives.updated";
+    /** 0.5.0: the nightly job wrote this series row. */
+    readonly ProgramSeriesUpdated: "program_series.updated";
 };
 export type EventType = (typeof EventType)[keyof typeof EventType];
 /** Derive the verb from an event type's suffix. */

@@ -123,8 +123,12 @@
  * week it is sent in. The server takes the periods from its own UTC clock at
  * receipt. A token is stable for one program within one period and nothing
  * links it to the next period's token, so nothing links two uploads across a
- * calendar month. The server keeps only sha256 of each token, with its period
- * and the region it was first seen in, and deletes it two periods later.
+ * calendar month. For counting, the server keeps sha256 of each token, with
+ * its period and the region it was first seen in, and deletes it two periods
+ * later. A stored program document keeps its programs' tokens for the same
+ * two months (0.5.0): a nightly job folds each program's month into a derived
+ * series row with no token in its id, then sets `weekToken` and `monthToken`
+ * to null in every document older than the month before last.
  * The schema accepts 22 to 44 base64url characters so the length can change
  * without a contract break.
  *
@@ -156,10 +160,71 @@
  * rollup any more, so a run reported by a pulse and again in the week's
  * document counts once.
  *
+ * Item names count distinct programs (0.5.0): for each item name the server
+ * records the pair (month, sha256(name), sha256(monthToken)) once, and the
+ * name rollup's `count` is the number of distinct month tokens that carried
+ * the name in the row's month; `uploads` keeps the old count of occurrences.
+ * A name row reaches an admin, by sync or broadcast, only at
+ * `NAME_ROLLUP_MIN_CONTRIBUTORS` (k = 10) or more (rows.ts).
+ *
  * Error codes (beside 429 RATE_LIMITED from the per-IP limiter): INVALID,
  * CHALLENGE_INVALID, DOCUMENT_INVALID, ATTESTATION_INVALID, ASSERTION_INVALID
  * (each 400), KEY_UNKNOWN (404), KEY_EXPIRED (410), COUNTER_REPLAY (409),
  * CONFLICT (409, key already attested), KEY_QUOTA (429), NOT_YET (501, Android).
+ */
+/**
+ * Purposes (0.5.0): what the numbers may be used for
+ * --------------------------------------------------
+ * Consent has three purposes, sent as `purposes` (`SignalPurposes`) on the
+ * day key's context and at the top of every program document, and kept by
+ * the server as a bitmask (`SIGNAL_PURPOSE_BITS`, `signalPurposesMask`):
+ *
+ *   improve  = 1  making Nagatha better: internal analysis by the people who
+ *                 make her. "Continue" on the first-launch screen says yes to
+ *                 this, and only this. Always set: with sharing off nothing
+ *                 is sent at all.
+ *   publish  = 2  being counted in totals we publish (a study, a post, the
+ *                 website), at least 50 contributors a figure, 100 for
+ *                 health-adjacent cohorts (rehab, quit, medication). Its own
+ *                 switch, off until the person turns it on.
+ *   research = 4  being counted in aggregate totals shared with researchers,
+ *                 at the same thresholds, never row-level data. Its own
+ *                 switch, off until the person turns it on.
+ *
+ * `consentVersion` is the version of the consent screen the person answered:
+ * 1: the first consent screen, improve only, no switches (installs in the
+ * field already carry this); 2: adds the publish and research switches. The
+ * numbering is fixed. The phone keeps its answers and the version on the
+ * device, beside the install secret, and sends what the person agreed to;
+ * `publish` and `research` are false unless chosen.
+ *
+ * The rule, for the server and anything downstream of it:
+ *  - The server keeps the mask and `consentVersion` on the day key's row for
+ *    its 24 hours, and stamps the mask on everything that key signs: each
+ *    document row, and each counter a pulse, document or attestation adds to.
+ *    A document whose own `purposes` disagrees with its key's is stamped with
+ *    the intersection of the two (bitwise AND), so a bit counts only when
+ *    both say it.
+ *  - The plain rollup counters count everything. The `*Publish` and
+ *    `*Research` counters (rows.ts `SignalRollupRow`) count only what came
+ *    with that bit. An upload without a bit never enters an aggregate for
+ *    that purpose, published or shared.
+ *  - Consent given before the switches existed carries no bits beyond
+ *    improve: a 0.4.0 phone sends no `purposes`, and its key and documents
+ *    are treated as improve only with `consentVersion` 0; a `consentVersion`
+ *    of 1 is improve only too, both bits off whatever the bits say, because
+ *    that screen had no switches. Only version 2 and later can carry publish
+ *    or research. Nothing collected before 0.5.0 ever enters a published or
+ *    shared total.
+ *  - Three bits add no link between days or uploads: every phone with the
+ *    same answers sends the same mask.
+ *
+ * Richer document fields (0.5.0), each optional so older phones validate:
+ * the chosen `voice` (a persona id from the app's list, or "other"); per item
+ * `weekDone`, the runs finished this ISO week (0 to 200); per program
+ * `currentStage`, the index of the stage it is in; and per abstain item
+ * `streakBand`, the current streak as a band ("0", "1-3", "4-7", "8-30",
+ * "31+"), never the exact days.
  */
 import { z } from "zod";
 export const SIGNAL_CHALLENGE_TTL_SECONDS = 120;
@@ -227,6 +292,68 @@ export const SignalContext = z.strictObject({
     region: regionCode,
     timeZone: timeZoneId,
 });
+/** The purposes bitmask (0.5.0; see "Purposes" above). */
+export const SIGNAL_PURPOSE_BITS = Object.freeze({ improve: 1, publish: 2, research: 4 });
+/** The mask a phone that sent no `purposes` (0.4.0 and before) is treated as having: improve only. */
+export const SIGNAL_PURPOSES_LEGACY_MASK = SIGNAL_PURPOSE_BITS.improve;
+/** The `consentVersion` the server records for a phone that sent no `purposes`. */
+export const SIGNAL_CONSENT_VERSION_LEGACY = 0;
+/** The first `consentVersion` whose screen has the publish and research switches. Version 1 had none. */
+export const SIGNAL_CONSENT_VERSION_SWITCHES = 2;
+/** The highest `consentVersion` accepted (it is kept as a smallint). */
+export const SIGNAL_CONSENT_VERSION_MAX = 32_767;
+/**
+ * What the person agreed to (0.5.0). `improve` is always true (Continue);
+ * `publish` and `research` are the two switches, false unless chosen.
+ * Strict.
+ */
+export const SignalPurposes = z.strictObject({
+    improve: z.literal(true),
+    publish: z.boolean().default(false),
+    research: z.boolean().default(false),
+    consentVersion: z.number().int().min(1).max(SIGNAL_CONSENT_VERSION_MAX),
+});
+/**
+ * The bitmask for a parsed `purposes`: the legacy improve-only mask when
+ * there is none, and also for `consentVersion` 1 (a screen with no switches),
+ * whatever its bits say.
+ */
+export function signalPurposesMask(p) {
+    if (!p || p.consentVersion < SIGNAL_CONSENT_VERSION_SWITCHES)
+        return SIGNAL_PURPOSES_LEGACY_MASK;
+    return SIGNAL_PURPOSE_BITS.improve | (p.publish ? SIGNAL_PURPOSE_BITS.publish : 0) | (p.research ? SIGNAL_PURPOSE_BITS.research : 0);
+}
+/** True when `mask` carries `bit`. */
+export function hasSignalPurpose(mask, bit) {
+    return (mask & SIGNAL_PURPOSE_BITS[bit]) !== 0;
+}
+/**
+ * The persona ids of the app's voice list (`ios/Nagatha/Resources/Vocab.json`),
+ * plus "other" for a voice this list does not know yet (0.5.0). The app is
+ * Nagatha whichever voice is chosen; this says which manner, never who.
+ */
+export const SignalVoice = z.enum([
+    "nagatha",
+    "gentle",
+    "sarcastic",
+    "supernag",
+    "painInMyBum",
+    "sassy",
+    "sergeant",
+    "coach",
+    "mum",
+    "rude",
+    "flirt",
+    "dominant",
+    "submissive",
+    "roast",
+    "plain",
+    "other",
+]);
+/** An abstain item's current streak, as a band (0.5.0). */
+export const StreakBand = z.enum(["0", "1-3", "4-7", "8-30", "31+"]);
+/** The most runs one item may report finished in one week (`weekDone`). */
+export const ITEM_WEEK_DONE_MAX = 200;
 export const ItemKind = z.enum(["timed", "count", "tick", "checkIn", "abstain"]);
 export const CadenceKind = z.enum(["spread", "fixed", "weekdays", "weekly", "deadline", "daily"]);
 export const SignalCadence = z.strictObject({
@@ -268,11 +395,20 @@ function routineBlockCount(blocks) {
 export const SignalRoutine = z
     .strictObject({ blocks: z.array(RoutineBlock).min(1).max(MAX_ROUTINE_BLOCKS) })
     .refine((r) => routineBlockCount(r.blocks) <= MAX_ROUTINE_BLOCKS, `a routine holds at most ${MAX_ROUTINE_BLOCKS} blocks, counting those inside groups`);
-export const SignalItem = z.strictObject({
+export const SignalItem = z
+    .strictObject({
     name,
     kind: ItemKind,
     cadence: SignalCadence,
     routine: SignalRoutine.optional(),
+    /** Runs of this item finished this ISO week, 0 to 200 (0.5.0). */
+    weekDone: z.number().int().min(0).max(ITEM_WEEK_DONE_MAX).optional(),
+    /** Abstain items only: the current streak as a band (0.5.0). */
+    streakBand: StreakBand.optional(),
+})
+    .refine((item) => item.streakBand === undefined || item.kind === "abstain", {
+    path: ["streakBand"],
+    message: "a streak band rides only on abstain items",
 });
 export const StageExitKind = z.enum(["date", "doneCount", "streak", "checkpoint", "manual"]);
 export const SignalStage = z.strictObject({
@@ -297,6 +433,11 @@ export const SignalProgram = z.strictObject({
     ageWeeks: z.number().int().min(0).max(1040),
     keptAt: z.strictObject({ d7: z.boolean(), d30: z.boolean(), d90: z.boolean() }),
     stages: z.array(SignalStage).min(1).max(10),
+    /** The index into `stages` of the stage the program is in now (0.5.0). */
+    currentStage: z.number().int().min(0).max(9).optional(),
+}).refine((p) => p.currentStage === undefined || p.currentStage < p.stages.length, {
+    path: ["currentStage"],
+    message: "the current stage must be one of the program's stages",
 });
 export const SignalEventCounts = z.strictObject({
     nagsShown: count(20_000),
@@ -320,6 +461,13 @@ export const SignalDocumentV1 = z
     .strictObject({
     version: z.literal(1),
     context: SignalContext,
+    /**
+     * What the person agreed to (0.5.0). A 0.5.0 phone always sends it; a
+     * document without it (0.4.0) is improve only, consent version 0.
+     */
+    purposes: SignalPurposes.optional(),
+    /** The chosen voice's persona id (0.5.0). */
+    voice: SignalVoice.optional(),
     programs: z.array(SignalProgram).max(20),
     events: SignalEvents,
 })
@@ -408,11 +556,16 @@ export const SIGNAL_GAP_DAYS_MAX = 30;
 /**
  * `SignalKeyRequest.context` (0.4.0): the full `SignalContext` plus `gapDays`,
  * an integer 1 to 30 (days since this phone was last counted active, capped
- * at 30) or `null` (never counted before). Strict.
+ * at 30) or `null` (never counted before), and (0.5.0) `purposes`. Strict.
  */
 export const SignalKeyContext = z.strictObject({
     ...SignalContext.shape,
     gapDays: z.number().int().min(1).max(SIGNAL_GAP_DAYS_MAX).nullable(),
+    /**
+     * What the person agreed to (0.5.0). A 0.5.0 phone always sends it; a key
+     * without it (0.4.0) is improve only, consent version 0.
+     */
+    purposes: SignalPurposes.optional(),
 });
 /**
  * The phone's `gapDays` for a first attestation on UTC day `today`, from the

@@ -16,6 +16,8 @@ export const SyncType = {
   SignalHourRollup: "signal_hour_rollup",
   /** 0.4.0: rolling 7 and 30 day active phones per region and per time zone. */
   SignalActives: "signal_actives",
+  /** 0.5.0: one program's month, derived nightly; the last 90 days. */
+  ProgramSeries: "program_series",
 } as const;
 
 export type SyncType = (typeof SyncType)[keyof typeof SyncType];
@@ -26,6 +28,7 @@ export const SYNC_TYPES: readonly SyncType[] = [
   SyncType.SignalNameRollup,
   SyncType.SignalHourRollup,
   SyncType.SignalActives,
+  SyncType.ProgramSeries,
 ];
 
 /** The signed-in person. A socket only ever receives its own user row. */
@@ -62,6 +65,13 @@ export interface UserRow {
  * adds `uploads` and `programs` only, and its counts stay in the stored
  * document.
  *
+ * The purpose counters (0.5.0; signals.ts "Purposes"): `devicesPublish`,
+ * `uploadsPublish` and `pulsesPublish` are the part of `devices`, `uploads`
+ * and `pulses` that came with the publish bit, and the `*Research` three the
+ * part that came with the research bit. Each is a subset of its plain
+ * counter. Only these subsets may ever feed a published or shared total;
+ * everything collected before 0.5.0 is in the plain counters only.
+ *
  * `newProgramsWeek` and `newProgramsMonth` (0.3.0) count first sightings: a
  * program's week token (or month token), from a pulse or a document, seen for
  * the first time in its UTC ISO week (or UTC month), counted on the day and
@@ -96,20 +106,49 @@ export interface SignalRollupRow {
   newProgramsWeek: number;
   /** Month tokens first seen in their month (0.3.0). */
   newProgramsMonth: number;
+  /** `devices` from keys whose purposes carried publish (0.5.0). */
+  devicesPublish: number;
+  /** `devices` from keys whose purposes carried research (0.5.0). */
+  devicesResearch: number;
+  /** `uploads` stamped with publish (0.5.0). */
+  uploadsPublish: number;
+  /** `uploads` stamped with research (0.5.0). */
+  uploadsResearch: number;
+  /** `pulses` signed by a key whose purposes carried publish (0.5.0). */
+  pulsesPublish: number;
+  /** `pulses` signed by a key whose purposes carried research (0.5.0). */
+  pulsesResearch: number;
   updatedAt: string;
 }
 
 /**
- * How many uploaded items carried this name and kind on one UTC day. Super
- * admins only. `id` is `${day}|${itemKind}|${name}`: the name goes last so the
- * id splits unambiguously at the first two bars even when a name holds one.
+ * The k of distinct contributors (0.5.0): a name rollup row reaches an admin,
+ * by sync, diff or broadcast, only when its `count` is at least this.
+ */
+export const NAME_ROLLUP_MIN_CONTRIBUTORS = 10;
+
+/**
+ * One item name and kind on one UTC day. Super admins only. `id` is
+ * `${day}|${itemKind}|${name}`: the name goes last so the id splits
+ * unambiguously at the first two bars even when a name holds one.
+ *
+ * `count` (redefined in 0.5.0) is distinct contributors: the number of
+ * distinct programs (month tokens) that carried this name, any kind, in the
+ * calendar month of `day`, as of the row's last update that month. It only
+ * grows within a month, so the latest row of a month holds the month's
+ * figure; never sum it across days. `uploads` is the old meaning: how many
+ * items in that day's uploads carried this name and kind. Rows with `count`
+ * below `NAME_ROLLUP_MIN_CONTRIBUTORS` are never sent.
  */
 export interface SignalNameRollupRow {
   id: string;
   day: string;
   name: string;
   itemKind: string;
+  /** Distinct programs carrying the name in the day's month (0.5.0). */
   count: number;
+  /** Items carrying this name and kind in the day's uploads (0.5.0; the old `count`). */
+  uploads: number;
   updatedAt: string;
 }
 
@@ -191,6 +230,65 @@ export interface SignalActivesRow {
   updatedAt: string;
 }
 
+/** Days of `program_series` a full sync sends: rows whose period overlaps the last 90 UTC days. */
+export const PROGRAM_SERIES_SYNC_DAYS = 90;
+
+export type ProgramSeriesCadenceKind = "spread" | "fixed" | "weekdays" | "weekly" | "deadline" | "daily";
+
+/**
+ * One program's calendar month, derived by the nightly job (0.5.0) from the
+ * program documents that carried its month token that month, and the run
+ * pulses that carried it. Super admins only. Synced for the periods
+ * overlapping the last 90 days and broadcast when the job rewrites a row.
+ *
+ * `id` is `${period}|${seriesKey}` (`programSeriesId`): `seriesKey` is an
+ * opaque 16-hex key the server derives from the token hash; the token and
+ * its hash never leave the server. No field links a series to a phone, to a
+ * key, to another month or to a document.
+ *
+ * Configuration facts (`kind` to `cadenceKinds`) come from the month's last
+ * document. `routineBlocks` counts blocks inside groups; `timesPerDayMax` is
+ * the largest times a day of any item (`timesPerDay`, else the count of
+ * `fixedTimes`, else 1). `configChanges` counts the documents whose program
+ * shape (stages, items, cadences, routines) differs from the document before.
+ * `daysSeen` is the distinct UTC days with a document; `persistenceDays` the
+ * UTC days from the first to the last of them, both inclusive.
+ *
+ * `adherencePct`: runs finished over due slots, as a percentage to one
+ * decimal place, capped at 100, null when nothing was due. Runs finished:
+ * the larger of the run pulses carrying the month token and the documents'
+ * own count (per ISO week, the week's last document: its items' `weekDone`
+ * summed, or the week's `runsFinished` when the document carries this one
+ * program only). Due slots: the current stage's items' daily slots (abstain
+ * and deadline items none, weekdays and weekly items pro rata over 7 days)
+ * times `persistenceDays`. A measure of doing what was set, never of
+ * effectiveness. `purposes` is the bitwise AND of the month's documents'
+ * stamped masks, so a series enters a purpose's aggregate only when every
+ * document in it carried that bit.
+ */
+export interface ProgramSeriesRow {
+  id: string;
+  /** UTC month, `YYYY-MM`. */
+  period: string;
+  region: string;
+  kind: string;
+  source: string;
+  templateId: string | null;
+  ageWeeksAtEnd: number;
+  stageCount: number;
+  itemCount: number;
+  routineBlocks: number;
+  timesPerDayMax: number;
+  cadenceKinds: ProgramSeriesCadenceKind[];
+  configChanges: number;
+  daysSeen: number;
+  adherencePct: number | null;
+  persistenceDays: number;
+  voice: string | null;
+  purposes: number;
+  computedAt: string;
+}
+
 /** Row type per sync type, for typed routing on the client. */
 export interface SyncRowByType {
   user: UserRow;
@@ -198,6 +296,7 @@ export interface SyncRowByType {
   signal_name_rollup: SignalNameRollupRow;
   signal_hour_rollup: SignalHourRollupRow;
   signal_actives: SignalActivesRow;
+  program_series: ProgramSeriesRow;
 }
 
 /** Build the rollup ids, so server and client never disagree on them. */
@@ -216,4 +315,9 @@ export function signalHourRollupId(hour: string, timeZone: string): string {
 
 export function signalActivesId(scope: SignalActivesScope, key: string): string {
   return `${scope}|${key}`;
+}
+
+/** `seriesKey` is the server's opaque key for one program's month (see `ProgramSeriesRow`). */
+export function programSeriesId(period: string, seriesKey: string): string {
+  return `${period}|${seriesKey}`;
 }

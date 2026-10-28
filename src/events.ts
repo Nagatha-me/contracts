@@ -170,6 +170,8 @@ export const EventType = {
   SignalHourRollupUpdated: "signal_hour_rollup.updated",
   /** 0.4.0 */
   SignalActivesUpdated: "signal_actives.updated",
+  /** 0.5.0: the nightly job wrote this series row. */
+  ProgramSeriesUpdated: "program_series.updated",
 } as const;
 
 export type EventType = (typeof EventType)[keyof typeof EventType];

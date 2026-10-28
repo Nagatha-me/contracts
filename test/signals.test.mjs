@@ -22,6 +22,17 @@ import {
   SYNC_TYPES,
   EventType,
   verbOf,
+  NAME_ROLLUP_MIN_CONTRIBUTORS,
+  PROGRAM_SERIES_SYNC_DAYS,
+  SIGNAL_PURPOSE_BITS,
+  SIGNAL_PURPOSES_LEGACY_MASK,
+  SIGNAL_CONSENT_VERSION_LEGACY,
+  SIGNAL_CONSENT_VERSION_SWITCHES,
+  SignalPurposes,
+  SignalVoice,
+  hasSignalPurpose,
+  programSeriesId,
+  signalPurposesMask,
 } from "../dist/index.js";
 
 const doc = {
@@ -270,10 +281,89 @@ test("the phone's gapDays rule, as documented at the top of signals.ts", () => {
 });
 
 test("the rolling active types sync and broadcast", () => {
-  assert.deepEqual(SYNC_TYPES.slice(-2), ["signal_hour_rollup", "signal_actives"]);
+  assert.deepEqual(SYNC_TYPES.slice(3, 5), ["signal_hour_rollup", "signal_actives"]);
   assert.equal(EventType.SignalHourRollupUpdated, "signal_hour_rollup.updated");
   assert.equal(EventType.SignalActivesUpdated, "signal_actives.updated");
   assert.equal(signalHourRollupId("2026-10-26T10:00:00.000Z", "Australia/Sydney"), "2026-10-26T10:00:00.000Z|Australia/Sydney");
   assert.equal(signalActivesId("zone", "Europe/Berlin"), "zone|Europe/Berlin");
   assert.equal(signalActivesId("region", "AU"), "region|AU");
+});
+
+// ------------------------------------------------------------
+// 0.5.0: purposes, richer fields, distinct contributors, series
+// ------------------------------------------------------------
+
+const purposes = { improve: true, publish: true, research: false, consentVersion: 1 };
+
+test("purposes: improve always, the two switches default off, a version from 1, strict", () => {
+  assert.deepEqual(SignalPurposes.parse({ improve: true, consentVersion: 1 }), {
+    improve: true,
+    publish: false,
+    research: false,
+    consentVersion: 1,
+  });
+  assert.equal(SignalPurposes.safeParse({ ...purposes, improve: false }).success, false);
+  assert.equal(SignalPurposes.safeParse({ ...purposes, consentVersion: 0 }).success, false);
+  assert.equal(SignalPurposes.safeParse({ ...purposes, consentVersion: 1.5 }).success, false);
+  assert.equal(SignalPurposes.safeParse({ ...purposes, consentVersion: 40_000 }).success, false);
+  assert.equal(SignalPurposes.safeParse({ ...purposes, sell: true }).success, false);
+});
+
+test("the purposes mask: improve 1, publish 2, research 4; none sent is improve only, version 0", () => {
+  assert.deepEqual({ ...SIGNAL_PURPOSE_BITS }, { improve: 1, publish: 2, research: 4 });
+  assert.equal(signalPurposesMask({ publish: false, research: false, consentVersion: 2 }), 1);
+  assert.equal(signalPurposesMask({ publish: true, research: false, consentVersion: 2 }), 3);
+  assert.equal(signalPurposesMask({ publish: false, research: true, consentVersion: 2 }), 5);
+  assert.equal(signalPurposesMask({ publish: true, research: true, consentVersion: 3 }), 7);
+  assert.equal(signalPurposesMask(undefined), SIGNAL_PURPOSES_LEGACY_MASK);
+  // Version 1 had no switches: improve only, whatever the bits say.
+  assert.equal(signalPurposesMask({ publish: true, research: true, consentVersion: 1 }), 1);
+  assert.equal(SIGNAL_CONSENT_VERSION_SWITCHES, 2);
+  assert.equal(SIGNAL_PURPOSES_LEGACY_MASK, 1);
+  assert.equal(SIGNAL_CONSENT_VERSION_LEGACY, 0);
+  assert.equal(hasSignalPurpose(5, "research"), true);
+  assert.equal(hasSignalPurpose(5, "publish"), false);
+});
+
+test("purposes ride on the key context and the document, and older shapes still validate", () => {
+  const key = (context) => ({ challenge: "A".repeat(43), keyId: KEY_ID, attestation: "AAAA", context });
+  assert.equal(SignalKeyRequest.safeParse(key({ ...doc.context, gapDays: 3, purposes })).success, true);
+  assert.equal(SignalKeyRequest.safeParse(key({ ...doc.context, gapDays: 3 })).success, true);
+  assert.equal(SignalKeyRequest.safeParse(key({ ...doc.context, gapDays: 3, purposes: { ...purposes, improve: false } })).success, false);
+  assert.equal(SignalDocumentV1.safeParse({ ...doc, purposes }).success, true);
+  assert.equal(SignalDocumentV1.safeParse(doc).success, true);
+  assert.equal(SignalDocumentV1.safeParse({ ...doc, purposes: { ...purposes, extra: 1 } }).success, false);
+});
+
+test("the voice is a persona id or other", () => {
+  assert.equal(SignalVoice.options.length, 16);
+  assert.ok(SignalVoice.options.includes("other"));
+  assert.equal(SignalDocumentV1.safeParse({ ...doc, voice: "sergeant" }).success, true);
+  assert.equal(SignalDocumentV1.safeParse({ ...doc, voice: "Sergeant" }).success, false);
+  assert.equal(SignalDocumentV1.safeParse({ ...doc, voice: "My own voice" }).success, false);
+});
+
+test("weekDone, currentStage and streakBand are optional, bounded and strict", () => {
+  const item = (over) => ({ name: "Water", kind: "tick", cadence: { kind: "daily", timesPerDay: 4 }, ...over });
+  const withItems = (items, over = {}) =>
+    docWith([{ ...programWith([{ name: "One", exit: { kind: "manual" }, items }]), ...over }]);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item({ weekDone: 0 })])).success, true);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item({ weekDone: 200 })])).success, true);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item({ weekDone: 201 })])).success, false);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item({ weekDone: -1 })])).success, false);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item({ weekDone: 2.5 })])).success, false);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item({ kind: "abstain", streakBand: "8-30" })])).success, true);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item({ kind: "abstain", streakBand: "9" })])).success, false);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item({ streakBand: "0" })])).success, false);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item()], { currentStage: 0 })).success, true);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item()], { currentStage: 1 })).success, false);
+  assert.equal(SignalDocumentV1.safeParse(withItems([item()], { currentStage: -1 })).success, false);
+});
+
+test("name rows count distinct contributors at k = 10; program series sync for 90 days", () => {
+  assert.equal(NAME_ROLLUP_MIN_CONTRIBUTORS, 10);
+  assert.equal(PROGRAM_SERIES_SYNC_DAYS, 90);
+  assert.equal(SYNC_TYPES.at(-1), "program_series");
+  assert.equal(EventType.ProgramSeriesUpdated, "program_series.updated");
+  assert.equal(programSeriesId("2026-10", "0123456789abcdef"), "2026-10|0123456789abcdef");
 });

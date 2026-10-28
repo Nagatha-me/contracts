@@ -66,6 +66,8 @@ export const EventType = {
     SignalHourRollupUpdated: "signal_hour_rollup.updated",
     /** 0.4.0 */
     SignalActivesUpdated: "signal_actives.updated",
+    /** 0.5.0: the nightly job wrote this series row. */
+    ProgramSeriesUpdated: "program_series.updated",
 };
 /** Derive the verb from an event type's suffix. */
 export function verbOf(eventType) {

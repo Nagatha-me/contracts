@@ -10,10 +10,10 @@ ESM, TypeScript, `zod` 4 as the only dependency.
 | File | Contents |
 |---|---|
 | `src/events.ts` | `SocketEventName` (`SYNC_DATA`, `SYNC_COMPLETE`, `DIFF_SYNC`, `SYNC_RESET`, `SOCKET_EVENT`, `RPC`), the handshake `{ token, cursor?, scope? }`, `SyncScope`, every payload, the per-entity cursor rule, `EventType`, `verbOf` |
-| `src/rows.ts` | `SyncType` and the row types `UserRow`, `SignalRollupRow` (with `pulses`, the per-kind counters, `devices`, `newProgramsWeek` and `newProgramsMonth`), `SignalNameRollupRow`, `SignalHourRollupRow` and `SignalActivesRow` (0.4.0, with the rolling window arithmetic), plus the id builders |
+| `src/rows.ts` | `SyncType` and the row types `UserRow`, `SignalRollupRow` (with `pulses`, the per-kind counters, `devices`, `newProgramsWeek`, `newProgramsMonth` and the 0.5.0 publish and research subsets), `SignalNameRollupRow` (distinct contributors, k = 10), `SignalHourRollupRow` and `SignalActivesRow` (0.4.0, with the rolling window arithmetic), `ProgramSeriesRow` (0.5.0), plus the id builders |
 | `src/rpc.ts` | `RpcRequest`, `RpcResponse`, `RpcMethod` (`ping`, `admin.whoami`) with inputs and outputs |
 | `src/auth.ts` | `GET /auth/socket-token` response, `POST /admin/claim` request and response |
-| `src/signals.ts` | The day key and assertion protocol, documented at the top; `SignalDocumentV1` (zod; per-array caps, at most 400 items and 2,000 routine blocks per document, no control characters in any string); `PulseDocumentV1`; the program token rule and `programPeriods`; the `GET /signals/challenge`, `POST /signals/key`, `POST /signals/pulse` and `POST /signals` shapes; the phone's `gapDays` and first-foreground rules and `signalGapDays`; `SignalErrorCode` with each code's HTTP status |
+| `src/signals.ts` | The day key and assertion protocol, and the purposes rule (0.5.0), documented at the top; `SignalPurposes` and the mask helpers; `SignalVoice`; `SignalDocumentV1` (zod; per-array caps, at most 400 items and 2,000 routine blocks per document, no control characters in any string); `PulseDocumentV1`; the program token rule and `programPeriods`; the `GET /signals/challenge`, `POST /signals/key`, `POST /signals/pulse` and `POST /signals` shapes; the phone's `gapDays` and first-foreground rules and `signalGapDays`; `SignalErrorCode` with each code's HTTP status |
 | `src/errors.ts` | `ErrorCode`, `WireError`, `RestErrorBody` |
 
 ## Rules a client must follow
@@ -55,6 +55,24 @@ ESM, TypeScript, `zod` 4 as the only dependency.
   (rolling 7 and 30 day active phones and new today, per region and per time
   zone), with `signal_hour_rollup.updated` and `signal_actives.updated`. The
   live 24 hour figure is the client's to roll from the hour rows.
+- **Signals 0.5.0, purposes and distinct contributors.** `SignalPurposes`
+  (`{ improve: true, publish, research, consentVersion }`) rides on
+  `SignalKeyRequest.context.purposes` and at the top of `SignalDocumentV1`;
+  the server keeps it as a bitmask (improve 1, publish 2, research 4) and
+  stamps it on everything the key signs. A 0.5.0 phone always sends it; a
+  0.4.0 phone that sends none is accepted as improve only, consent version 0,
+  so nothing from before 0.5.0 enters a published or shared total.
+  `consentVersion` 1 is the first consent screen (improve only, no switches,
+  what installs in the field carry) and 2 adds the publish and research
+  switches; version 1 counts as improve only whatever its bits say. The
+  document gains optional `voice`, per item `weekDone`, per program
+  `currentStage` and per abstain item `streakBand`. `SignalRollupRow` gains
+  the `devices`, `uploads` and `pulses` subsets for publish and research.
+  `SignalNameRollupRow.count` now counts distinct programs in the day's month
+  (k = `NAME_ROLLUP_MIN_CONTRIBUTORS`, 10, before a row is sent) and
+  `uploads` keeps the old occurrence count. A new sync type,
+  `program_series` (`ProgramSeriesRow`, the nightly derived month of one
+  program, last 90 days), goes last, with `program_series.updated`.
 
 ## Versioning
 

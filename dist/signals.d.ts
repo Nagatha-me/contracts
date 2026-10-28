@@ -123,8 +123,12 @@
  * week it is sent in. The server takes the periods from its own UTC clock at
  * receipt. A token is stable for one program within one period and nothing
  * links it to the next period's token, so nothing links two uploads across a
- * calendar month. The server keeps only sha256 of each token, with its period
- * and the region it was first seen in, and deletes it two periods later.
+ * calendar month. For counting, the server keeps sha256 of each token, with
+ * its period and the region it was first seen in, and deletes it two periods
+ * later. A stored program document keeps its programs' tokens for the same
+ * two months (0.5.0): a nightly job folds each program's month into a derived
+ * series row with no token in its id, then sets `weekToken` and `monthToken`
+ * to null in every document older than the month before last.
  * The schema accepts 22 to 44 base64url characters so the length can change
  * without a contract break.
  *
@@ -156,10 +160,71 @@
  * rollup any more, so a run reported by a pulse and again in the week's
  * document counts once.
  *
+ * Item names count distinct programs (0.5.0): for each item name the server
+ * records the pair (month, sha256(name), sha256(monthToken)) once, and the
+ * name rollup's `count` is the number of distinct month tokens that carried
+ * the name in the row's month; `uploads` keeps the old count of occurrences.
+ * A name row reaches an admin, by sync or broadcast, only at
+ * `NAME_ROLLUP_MIN_CONTRIBUTORS` (k = 10) or more (rows.ts).
+ *
  * Error codes (beside 429 RATE_LIMITED from the per-IP limiter): INVALID,
  * CHALLENGE_INVALID, DOCUMENT_INVALID, ATTESTATION_INVALID, ASSERTION_INVALID
  * (each 400), KEY_UNKNOWN (404), KEY_EXPIRED (410), COUNTER_REPLAY (409),
  * CONFLICT (409, key already attested), KEY_QUOTA (429), NOT_YET (501, Android).
+ */
+/**
+ * Purposes (0.5.0): what the numbers may be used for
+ * --------------------------------------------------
+ * Consent has three purposes, sent as `purposes` (`SignalPurposes`) on the
+ * day key's context and at the top of every program document, and kept by
+ * the server as a bitmask (`SIGNAL_PURPOSE_BITS`, `signalPurposesMask`):
+ *
+ *   improve  = 1  making Nagatha better: internal analysis by the people who
+ *                 make her. "Continue" on the first-launch screen says yes to
+ *                 this, and only this. Always set: with sharing off nothing
+ *                 is sent at all.
+ *   publish  = 2  being counted in totals we publish (a study, a post, the
+ *                 website), at least 50 contributors a figure, 100 for
+ *                 health-adjacent cohorts (rehab, quit, medication). Its own
+ *                 switch, off until the person turns it on.
+ *   research = 4  being counted in aggregate totals shared with researchers,
+ *                 at the same thresholds, never row-level data. Its own
+ *                 switch, off until the person turns it on.
+ *
+ * `consentVersion` is the version of the consent screen the person answered:
+ * 1: the first consent screen, improve only, no switches (installs in the
+ * field already carry this); 2: adds the publish and research switches. The
+ * numbering is fixed. The phone keeps its answers and the version on the
+ * device, beside the install secret, and sends what the person agreed to;
+ * `publish` and `research` are false unless chosen.
+ *
+ * The rule, for the server and anything downstream of it:
+ *  - The server keeps the mask and `consentVersion` on the day key's row for
+ *    its 24 hours, and stamps the mask on everything that key signs: each
+ *    document row, and each counter a pulse, document or attestation adds to.
+ *    A document whose own `purposes` disagrees with its key's is stamped with
+ *    the intersection of the two (bitwise AND), so a bit counts only when
+ *    both say it.
+ *  - The plain rollup counters count everything. The `*Publish` and
+ *    `*Research` counters (rows.ts `SignalRollupRow`) count only what came
+ *    with that bit. An upload without a bit never enters an aggregate for
+ *    that purpose, published or shared.
+ *  - Consent given before the switches existed carries no bits beyond
+ *    improve: a 0.4.0 phone sends no `purposes`, and its key and documents
+ *    are treated as improve only with `consentVersion` 0; a `consentVersion`
+ *    of 1 is improve only too, both bits off whatever the bits say, because
+ *    that screen had no switches. Only version 2 and later can carry publish
+ *    or research. Nothing collected before 0.5.0 ever enters a published or
+ *    shared total.
+ *  - Three bits add no link between days or uploads: every phone with the
+ *    same answers sends the same mask.
+ *
+ * Richer document fields (0.5.0), each optional so older phones validate:
+ * the chosen `voice` (a persona id from the app's list, or "other"); per item
+ * `weekDone`, the runs finished this ISO week (0 to 200); per program
+ * `currentStage`, the index of the stage it is in; and per abstain item
+ * `streakBand`, the current streak as a band ("0", "1-3", "4-7", "8-30",
+ * "31+"), never the exact days.
  */
 import { z } from "zod";
 export declare const SIGNAL_CHALLENGE_TTL_SECONDS = 120;
@@ -194,6 +259,75 @@ export declare const SignalContext: z.ZodObject<{
     timeZone: z.ZodString;
 }, z.core.$strict>;
 export type SignalContext = z.infer<typeof SignalContext>;
+/** The purposes bitmask (0.5.0; see "Purposes" above). */
+export declare const SIGNAL_PURPOSE_BITS: Readonly<{
+    readonly improve: 1;
+    readonly publish: 2;
+    readonly research: 4;
+}>;
+/** The mask a phone that sent no `purposes` (0.4.0 and before) is treated as having: improve only. */
+export declare const SIGNAL_PURPOSES_LEGACY_MASK: 1;
+/** The `consentVersion` the server records for a phone that sent no `purposes`. */
+export declare const SIGNAL_CONSENT_VERSION_LEGACY = 0;
+/** The first `consentVersion` whose screen has the publish and research switches. Version 1 had none. */
+export declare const SIGNAL_CONSENT_VERSION_SWITCHES = 2;
+/** The highest `consentVersion` accepted (it is kept as a smallint). */
+export declare const SIGNAL_CONSENT_VERSION_MAX = 32767;
+/**
+ * What the person agreed to (0.5.0). `improve` is always true (Continue);
+ * `publish` and `research` are the two switches, false unless chosen.
+ * Strict.
+ */
+export declare const SignalPurposes: z.ZodObject<{
+    improve: z.ZodLiteral<true>;
+    publish: z.ZodDefault<z.ZodBoolean>;
+    research: z.ZodDefault<z.ZodBoolean>;
+    consentVersion: z.ZodNumber;
+}, z.core.$strict>;
+export type SignalPurposes = z.infer<typeof SignalPurposes>;
+/**
+ * The bitmask for a parsed `purposes`: the legacy improve-only mask when
+ * there is none, and also for `consentVersion` 1 (a screen with no switches),
+ * whatever its bits say.
+ */
+export declare function signalPurposesMask(p: Pick<SignalPurposes, "publish" | "research" | "consentVersion"> | undefined | null): number;
+/** True when `mask` carries `bit`. */
+export declare function hasSignalPurpose(mask: number, bit: keyof typeof SIGNAL_PURPOSE_BITS): boolean;
+/**
+ * The persona ids of the app's voice list (`ios/Nagatha/Resources/Vocab.json`),
+ * plus "other" for a voice this list does not know yet (0.5.0). The app is
+ * Nagatha whichever voice is chosen; this says which manner, never who.
+ */
+export declare const SignalVoice: z.ZodEnum<{
+    nagatha: "nagatha";
+    gentle: "gentle";
+    sarcastic: "sarcastic";
+    supernag: "supernag";
+    painInMyBum: "painInMyBum";
+    sassy: "sassy";
+    sergeant: "sergeant";
+    coach: "coach";
+    mum: "mum";
+    rude: "rude";
+    flirt: "flirt";
+    dominant: "dominant";
+    submissive: "submissive";
+    roast: "roast";
+    plain: "plain";
+    other: "other";
+}>;
+export type SignalVoice = z.infer<typeof SignalVoice>;
+/** An abstain item's current streak, as a band (0.5.0). */
+export declare const StreakBand: z.ZodEnum<{
+    0: "0";
+    "1-3": "1-3";
+    "4-7": "4-7";
+    "8-30": "8-30";
+    "31+": "31+";
+}>;
+export type StreakBand = z.infer<typeof StreakBand>;
+/** The most runs one item may report finished in one week (`weekDone`). */
+export declare const ITEM_WEEK_DONE_MAX = 200;
 export declare const ItemKind: z.ZodEnum<{
     timed: "timed";
     count: "count";
@@ -343,6 +477,14 @@ export declare const SignalItem: z.ZodObject<{
             }, z.core.$strict>], "kind">>;
         }, z.core.$strict>], "kind">>;
     }, z.core.$strict>>;
+    weekDone: z.ZodOptional<z.ZodNumber>;
+    streakBand: z.ZodOptional<z.ZodEnum<{
+        0: "0";
+        "1-3": "1-3";
+        "4-7": "4-7";
+        "8-30": "8-30";
+        "31+": "31+";
+    }>>;
 }, z.core.$strict>;
 export type SignalItem = z.infer<typeof SignalItem>;
 export declare const StageExitKind: z.ZodEnum<{
@@ -419,6 +561,14 @@ export declare const SignalStage: z.ZodObject<{
                 }, z.core.$strict>], "kind">>;
             }, z.core.$strict>], "kind">>;
         }, z.core.$strict>>;
+        weekDone: z.ZodOptional<z.ZodNumber>;
+        streakBand: z.ZodOptional<z.ZodEnum<{
+            0: "0";
+            "1-3": "1-3";
+            "4-7": "4-7";
+            "8-30": "8-30";
+            "31+": "31+";
+        }>>;
     }, z.core.$strict>>;
 }, z.core.$strict>;
 export declare const ProgramKind: z.ZodEnum<{
@@ -529,8 +679,17 @@ export declare const SignalProgram: z.ZodObject<{
                     }, z.core.$strict>], "kind">>;
                 }, z.core.$strict>], "kind">>;
             }, z.core.$strict>>;
+            weekDone: z.ZodOptional<z.ZodNumber>;
+            streakBand: z.ZodOptional<z.ZodEnum<{
+                0: "0";
+                "1-3": "1-3";
+                "4-7": "4-7";
+                "8-30": "8-30";
+                "31+": "31+";
+            }>>;
         }, z.core.$strict>>;
     }, z.core.$strict>>;
+    currentStage: z.ZodOptional<z.ZodNumber>;
 }, z.core.$strict>;
 export type SignalProgram = z.infer<typeof SignalProgram>;
 export declare const SignalEventCounts: z.ZodObject<{
@@ -571,6 +730,30 @@ export declare const SignalDocumentV1: z.ZodObject<{
         region: z.ZodString;
         timeZone: z.ZodString;
     }, z.core.$strict>;
+    purposes: z.ZodOptional<z.ZodObject<{
+        improve: z.ZodLiteral<true>;
+        publish: z.ZodDefault<z.ZodBoolean>;
+        research: z.ZodDefault<z.ZodBoolean>;
+        consentVersion: z.ZodNumber;
+    }, z.core.$strict>>;
+    voice: z.ZodOptional<z.ZodEnum<{
+        nagatha: "nagatha";
+        gentle: "gentle";
+        sarcastic: "sarcastic";
+        supernag: "supernag";
+        painInMyBum: "painInMyBum";
+        sassy: "sassy";
+        sergeant: "sergeant";
+        coach: "coach";
+        mum: "mum";
+        rude: "rude";
+        flirt: "flirt";
+        dominant: "dominant";
+        submissive: "submissive";
+        roast: "roast";
+        plain: "plain";
+        other: "other";
+    }>>;
     programs: z.ZodArray<z.ZodObject<{
         weekToken: z.ZodString;
         monthToken: z.ZodString;
@@ -664,8 +847,17 @@ export declare const SignalDocumentV1: z.ZodObject<{
                         }, z.core.$strict>], "kind">>;
                     }, z.core.$strict>], "kind">>;
                 }, z.core.$strict>>;
+                weekDone: z.ZodOptional<z.ZodNumber>;
+                streakBand: z.ZodOptional<z.ZodEnum<{
+                    0: "0";
+                    "1-3": "1-3";
+                    "4-7": "4-7";
+                    "8-30": "8-30";
+                    "31+": "31+";
+                }>>;
             }, z.core.$strict>>;
         }, z.core.$strict>>;
+        currentStage: z.ZodOptional<z.ZodNumber>;
     }, z.core.$strict>>;
     events: z.ZodObject<{
         weekStart: z.ZodString;
@@ -737,10 +929,16 @@ export declare const SIGNAL_GAP_DAYS_MAX = 30;
 /**
  * `SignalKeyRequest.context` (0.4.0): the full `SignalContext` plus `gapDays`,
  * an integer 1 to 30 (days since this phone was last counted active, capped
- * at 30) or `null` (never counted before). Strict.
+ * at 30) or `null` (never counted before), and (0.5.0) `purposes`. Strict.
  */
 export declare const SignalKeyContext: z.ZodObject<{
     gapDays: z.ZodNullable<z.ZodNumber>;
+    purposes: z.ZodOptional<z.ZodObject<{
+        improve: z.ZodLiteral<true>;
+        publish: z.ZodDefault<z.ZodBoolean>;
+        research: z.ZodDefault<z.ZodBoolean>;
+        consentVersion: z.ZodNumber;
+    }, z.core.$strict>>;
     appBuild: z.ZodString;
     osMajor: z.ZodNumber;
     deviceClass: z.ZodString;
@@ -770,6 +968,12 @@ export declare const SignalKeyRequest: z.ZodObject<{
     attestation: z.ZodString;
     context: z.ZodObject<{
         gapDays: z.ZodNullable<z.ZodNumber>;
+        purposes: z.ZodOptional<z.ZodObject<{
+            improve: z.ZodLiteral<true>;
+            publish: z.ZodDefault<z.ZodBoolean>;
+            research: z.ZodDefault<z.ZodBoolean>;
+            consentVersion: z.ZodNumber;
+        }, z.core.$strict>>;
         appBuild: z.ZodString;
         osMajor: z.ZodNumber;
         deviceClass: z.ZodString;
